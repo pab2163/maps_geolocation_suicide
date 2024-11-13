@@ -1,0 +1,398 @@
+---
+title: "Data Cleaning & Aggregation (Single Home Location)"
+author: "Ranqing Lan - updated Paul Bloom"
+date: "Created 2023-04-21, updated 2024-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(plotly)
+library(crosstalk)
+library(shiny)
+library(DT)
+library(readxl,quietly=TRUE,warn.conflicts=FALSE)
+library(lubridate,quietly=TRUE,warn.conflicts=FALSE )
+library(zoo)
+library(openxlsx)
+rm(list=ls())
+
+# winsorization function
+imp_out_tukey <- function(x, k = 1.5, na.rm = TRUE) {
+  quar <- quantile(x, probs = c(0.25, 0.75), na.rm = na.rm)
+  iqr <- diff(quar)
+  ifelse(x <= (quar[1] - k * iqr), (quar[1] - k * iqr), ifelse(x >= (quar[2] + k * iqr), (quar[2] + k * iqr), x) )
+}
+```
+
+
+#### Merge All Data ######
+```{r}
+# Scripts from: /Volumes/auerbachlab/Columbia/MAPS_Data/Analysis/Wrangling/MAPS_StartEnd_Dates
+maps_all_dates <- read_csv("/Volumes/columbia/MAPS_Data/Analysis/Wrangling/MAPS_StartEnd_Dates/maps_all_dates_14-Apr-2023 15.09.csv", show_col_types = FALSE)
+
+## Suicide events
+load('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/STB_Risk/suicide_events_2024-10-23.rda')
+
+
+# Suicidal thoughts
+load('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/STB_Risk/riskdata.Rda')
+
+### Other Physical Tracking Data
+daily_combined <- read_csv('/Volumes/columbia/MAPS_Data/Ranqing/EARS/ears_data/daily_day_all.csv', show_col_types = FALSE)
+
+# remove duplicate days
+daily_combined <- daily_combined %>%
+  dplyr::select(ID, dt_local, daily) %>%
+  distinct(ID, dt_local, .keep_all = TRUE)
+
+# Read in EARS gps daily data, and separately coded entropy file
+gps_data <- read_csv("/Volumes/columbia/MAPS_Data/Ranqing/EARS/ears_data/gps_day_all.csv", show_col_types = FALSE)
+entropy <- read.csv("/Volumes/columbia/MAPS_Data/Ranqing/MAPS_suicidal_behavior/data/raw/gps_entropy_2023-02-13_10.16.csv")
+
+### Group label info
+cu_group <- read_csv("/Volumes/columbia/MAPS_Data/Qualtrics_Data/Baseline/MINI_KID/MAPS - MINI Kid_November 30, 2022_13.00.csv", show_col_types = FALSE)
+cu_group <- cu_group %>%
+  dplyr::select(id_1_i, group_1_i) %>%
+  dplyr::rename(ID = id_1_i, group = group_1_i) %>%
+  dplyr::mutate(ID = as.numeric(ID))
+cu_group <- cu_group[c(-1,-2), ]
+
+pitt_group <- read_excel('/Volumes/columbia/MAPS_Data/Suicidality_Report/MAPS_Suicidality_Report_2.17.23/PITT_ParticipantStatus_2023.02.17.xlsx')
+pitt_group <- pitt_group %>%
+  dplyr::rename(ID = PTID) %>%
+  dplyr::mutate(ID = as.numeric(ID),
+         group = ifelse(GROUP == 'PC' , 1, ifelse(GROUP == "SI", 2, 3))) %>%
+  dplyr::select(ID, group)
+pitt_group <- unique(pitt_group)
+
+group <- rbind(cu_group, pitt_group)
+rm(cu_group, pitt_group)
+
+group<- group %>%
+  mutate(group_char = ifelse(group ==  1, 'Control', ifelse(group == 2, "Ideator", "Attempter")))
+
+### Data Merge
+all_dates <- merge(maps_all_dates, group, by = 'ID', all.x = TRUE )
+all_dates <- all_dates %>% dplyr::select(ID, Date, start_date, end_date, TIMEPNT, group_char)
+all_dates <- merge(all_dates, daily_combined, by.x = c('ID', 'Date'), by.y = c('ID','dt_local'),all.x = TRUE)
+all_dates <- merge(all_dates, gps_data, by.x = c("ID", "Date"), by.y = c("ID", "dt_feature"),all.x = TRUE)
+data_all <- merge(all_dates, entropy, by.x = c("ID", "Date"), by.y = c("ID", 'dt_feature'), all.x = TRUE)
+```
+
+# Bring in covid data (for covariates)
+```{r}
+load('/Volumes/columbia/MAPS_Data/Analysis/pab_maps_scripts/cleaned_data/covid.Rda')
+covid= dplyr::select(covid, date, site, schoolclosure)
+
+data_all = mutate(data_all, site = ifelse(startsWith(as.character(ID), '1'), 'CUIMC', 'PITT'))
+data_all =left_join(data_all, dplyr::select(covid, Date=date, site, schoolclosure), by = c('Date', 'site'))
+
+data_all = mutate(data_all, 
+                schoolclosure = case_when(
+                    !is.na(schoolclosure) ~ schoolclosure,
+                    Date > '2022-06-01' ~ "0",
+                    Date < '2020-01-01' ~ "0"))
+```
+
+
+```{r}
+common_id <- Reduce(intersect, list(all_dates$ID,unique(gps_data$ID)))
+print(paste0("Number of ID with final dataset:  ", length(common_id)))
+
+data_all <- data_all %>%
+  filter(ID %in% common_id)
+
+print(length(unique(data_all$ID)))
+
+library(lubridate)
+data_all <- data_all %>%
+  mutate(   day = lubridate::day(Date),
+            wday = lubridate::wday(Date, label = TRUE)) %>%
+  mutate( week = ifelse(wday == "Sun" | wday == "Sat", "wkend", "wkday"))
+
+
+print(c('number with GPS:', length(unique(gps_data$ID))))
+```
+
+```{r}
+### N of subjects and suicidal events in complete dataset:
+print(paste0("N of subjects:  ", length(unique(data_all$ID))))
+```
+
+#### Data Cleaning ######
+```{r}
+data_day <-
+  data_all %>%
+  dplyr::group_by(ID) %>% 
+  dplyr::mutate(
+    day_num = round(as.numeric(difftime(Date, min(Date), units="days")), digits = 0),
+    summer = ifelse(month(Date) %in% c(7,8), "summer", ifelse(month(Date) %in% c(12,1), "winter", "other"))
+    ) %>% 
+    ungroup()
+
+# --------- 1. Cleaning the outliers ------------#
+data_day_processed <- data_day %>%
+  relocate(entropy, .after = amt_stoplocation_day_variance)%>%
+  filter(day_num < 185) %>%
+  mutate(
+    across(c(amt_travel_day_km:entropy), ~replace(., n_capture_day <5, NA)),
+    across(c(amt_travel_day_km:entropy), ~replace(., amt_travel_day_km > 1000, NA)),
+    across(c(amt_travel_day_km:entropy), ~replace(., (amt_home_day_minutes + amt_travel_day_minutes) > 60*24, NA)),#home stay minutes + travel day minutes > 24 h
+    across(c(amt_travel_day_km:entropy), ~replace(., amt_home_day_minutes >= 60*23 & amt_distancefromhome_day_max_km > 50, NA))
+    #stay at home most of the time but distancefromhome larger than 50km
+         ) %>%
+  group_by(ID) %>%
+  mutate(
+    across(c(amt_travel_day_km, amt_distancefromhome_day_max_km, amt_location_day_variance, amt_stoplocation_day_variance, entropy), imp_out_tukey)
+    ) %>% 
+  ungroup()
+  
+
+
+par(mfrow = c(2, 2)) 
+hist(data_day_processed$amt_home_day_minutes)
+hist(data_day_processed$amt_travel_day_minutes)
+hist(data_day_processed$amt_travel_day_km)
+
+# --------- 2. Variables Based on Home min, Travel min and Distance from home ------------#
+data_day_processed <- data_day_processed %>%
+  mutate(
+    ## Travel Time
+    travel= ifelse(amt_home_day_minutes == 0 & amt_distancefromhome_day_max_km > 0 & amt_travel_day_minutes > 0, "travel_tour",
+                          ifelse(amt_home_day_minutes == 0 & amt_distancefromhome_day_max_km > 0 & amt_travel_day_minutes == 0, "travel_hotel", 'no')),
+    ## Stay at home all day
+    home = ifelse(amt_home_day_minutes >= 60*23, "home_all_day", 'no'),
+    
+    ## Combine two variables
+    status = ifelse(travel != "no", "travel", ifelse(home != "no", home, 'other'))
+  )
+
+```
+
+# Visualizations for Vacations
+
+```{r}
+library("graphics")
+library(rcompanion)
+
+par(mfrow = c(2, 2)) 
+mosaicplot(table(data_day_processed$status, data_day_processed$summer), shade = TRUE, las=2,
+           main = "Status by vacation")
+chi <- chisq.test(table(data_day_processed$status, data_day_processed$summer))
+pairwiseNominalIndependence(table(data_day_processed$summer,data_day_processed$status), fisher = FALSE, method = 'fdr')
+
+
+mosaicplot(table(data_day_processed$status, data_day_processed$week), shade = TRUE, las=2,
+           main = "Status by vacation")
+chisq.test(table(data_day_processed$status, data_day_processed$week))
+pairwiseNominalIndependence(table(data_day_processed$week,data_day_processed$status), fisher = FALSE, method = 'fdr')
+```
+
+
+```{r}
+
+obs_frame = data_day_processed %>% dplyr::filter(TIMEPNT == 6)
+sum(!is.na(obs_frame$n_capture_day))
+sum(!is.na(obs_frame$n_capture_day))/nrow(obs_frame)
+
+data_day %>% dplyr::filter(n_capture_day <5) %>% nrow()
+data_day %>% dplyr::filter(amt_travel_day_km > 1000) %>% nrow()
+data_day %>% dplyr::filter(amt_home_day_minutes + amt_travel_day_minutes > 60*24) %>% nrow()
+data_day %>% dplyr::filter(amt_home_day_minutes >= 60*23 & amt_distancefromhome_day_max_km > 50) %>% nrow()
+
+
+```
+
+
+#### Wed - Wed Aggregation ####
+
+```{r}
+data_day_processed <- data_day_processed  %>%
+  arrange(ID, Date) %>%
+  group_by(ID) %>%
+  mutate(
+         day_num_wed = wday(Date, week_start = getOption("lubridate.week.start", 3))) %>% #From Thursday to Wednesday
+    mutate( 
+      start_wed_date = 
+      lubridate::floor_date(as_date(Date), unit = "week", week_start = getOption("lubridate.week.start", 3))
+  ) %>%
+  group_by(ID) %>%
+  dplyr::mutate(
+    week_num_wed = as.numeric(as_date(Date) - min(start_wed_date))%/%7
+  ) %>%
+  select(ID, Date,start_date,end_date, start_date_week_wednesday=start_wed_date, week_num_wed, day_num_wed, TIMEPNT, everything()) %>%
+  ungroup()
+```
+
+#### Features Aggregation ####
+
+
+################################################
+# Aggregation Method B for prediction:   
+# Week(t)  
+# 1. Suicidal Behaviors:  
+#   a) STB from interviews -- Wed(t) - Tues(t+1)  
+#   b) EMA Trigger -- Wed(t+1)  
+# 2. Passive Sensor Data + Mood Data:  
+#   Wed(t-1) - Tues(t)  
+################################################
+
+```{r}
+# aggregate at a weekly level
+data_weekly = data_day_processed %>%
+  group_by(ID, week_num_wed, group_char, start_date_week_wednesday) %>%
+  summarize(
+    ### If having less than 3-days data, then it's labeled 1
+    n_week_days = n(),
+    daily_missing3 = ifelse(sum(is.na(daily)) > 4, 1, 0 ),
+    gps_missing_pct = sum(is.na(amt_travel_day_km))/n(),
+    daily_missing_pct = sum(is.na(daily))/n(),
+    gps_missing3 = ifelse(sum(is.na(amt_travel_day_km)) > 4, 1, 0),
+    daily_mean =mean(daily, na.rm = TRUE),
+    n_capture_mean = mean(n_capture_day, na.rm = TRUE), 
+    travel_km_mean = mean(amt_travel_day_km, na.rm = TRUE),
+    travel_min_mean =  mean(amt_travel_day_minutes, na.rm = TRUE),
+    home_min_mean =mean(amt_home_day_minutes, na.rm = TRUE),
+    entropy_mean = mean(entropy, na.rm = TRUE), 
+    maxdist_home_mean = mean(amt_distancefromhome_day_max_km, na.rm = TRUE), 
+    loc_var_mean = mean(amt_location_day_variance, na.rm = TRUE), 
+    pct_home_all_day = sum(status == "home_all_day",na.rm = TRUE)/sum(!is.na(status)), 
+    pct_travel = sum(status == "travel",na.rm = TRUE)/sum(!is.na(status)),
+    pct_other = sum(status == "other",na.rm = TRUE)/sum(!is.na(status)), 
+    # if any school closure that week, label 1
+    schoolclosure = ifelse('1' %in% schoolclosure, 1, 0)
+    
+  ) %>%
+  #filter(!if_all(c(travel_km_mean), is.na)) %>% #daily_mean, n_char_mean
+  rename(week_num = week_num_wed) %>%
+  ungroup()
+
+```
+
+# Individual-specific means/medians of features, and weekly aggregates relative to individual-specific means/medians
+
+```{r}
+# calculate aggregates only based on weeks with 3 gps obs or more
+data_weekly <- data_weekly %>%
+  ungroup() %>%
+  group_by(ID) %>%
+  mutate(
+    travel_km_dev = travel_km_mean - mean(travel_km_mean[gps_missing3==0], na.rm = TRUE),
+    travel_km_idmed = median(travel_km_mean[gps_missing3==0], na.rm = TRUE),
+    travel_km_idmean = mean(travel_km_mean[gps_missing3==0], na.rm = TRUE),
+    home_min_dev = home_min_mean - mean(home_min_mean[gps_missing3==0], na.rm = TRUE),
+    home_min_idmed = median(home_min_mean[gps_missing3==0], na.rm = TRUE),
+    home_min_idmean = mean(home_min_mean[gps_missing3==0], na.rm = TRUE),
+    entropy_dev =  entropy_mean -  mean( entropy_mean[gps_missing3==0], na.rm = TRUE), 
+    entropy_idmean = mean(entropy_mean[gps_missing3==0], na.rm = TRUE),
+    loc_var_idmean = mean(loc_var_mean[gps_missing3==0], na.rm = TRUE),
+    maxdist_home_idmean = mean(maxdist_home_mean[gps_missing3==0], na.rm = TRUE),
+    maxdist_home_dev = maxdist_home_mean - mean(maxdist_home_mean[gps_missing3==0], na.rm = TRUE),
+    travel_min_idmean = mean(travel_min_mean[gps_missing3==0], na.rm = TRUE),
+    travel_min_dev = travel_min_mean - mean(travel_min_mean[gps_missing3==0], na.rm = TRUE),
+    daily_dev = daily_mean - mean(daily_mean[gps_missing3==0], na.rm = TRUE),
+    daily_idmean = mean(daily_mean[gps_missing3==0], na.rm = TRUE),
+         ) %>%
+  relocate(c(travel_km_dev, travel_km_idmed), .after = travel_km_mean) %>%
+  relocate(c(home_min_dev, home_min_idmed), .after = home_min_mean) %>%
+  relocate(c(daily_dev, daily_idmean), .after = daily_mean) %>%
+  ungroup()
+
+# hours to minutes
+data_weekly = mutate(data_weekly,
+                     home_h_dev = home_min_dev/60,
+                     home_h_idmed = home_min_idmed/60)
+
+
+homestay_median_0 = data_weekly %>%
+  dplyr::filter(home_min_idmed ==0) 
+
+unique(homestay_median_0$ID)
+```
+
+# Pull in suicide events and thoughts
+
+```{r}
+# add events
+data_weekly_with_stb = left_join(data_weekly %>% mutate(ID = as.character(ID)), 
+                                 dplyr::select(suicide_events_clean_weekly, ID=ptid, everything()), 
+                                 by = c('ID', 'start_date_week_wednesday')) %>%
+  mutate(event_cat1 = ifelse(!is.na(events), 1, 0))
+
+# add thoughts
+riskdata_v4 = mutate(riskdata_v4, ID = as.character(ID)) %>%
+  dplyr::select(ID, week_start_wednesday, submit_time_hour, submit_time_min, riskOne, riskTwo, riskThree) 
+
+
+data_weekly_with_stb = left_join(data_weekly_with_stb %>% dplyr::select(ID, week_start_wednesday=start_date_week_wednesday, everything()),
+                                 riskdata_v4, 
+                                 by = c('ID', 'week_start_wednesday')) %>%
+  mutate(ema_trigger = ifelse((riskOne %in% c('allTheTime', 'often') | riskTwo == 'yes' & riskThree == 'no'), 1, 0))
+
+
+# events / ema triggers next week
+data_weekly_with_stb = data_weekly_with_stb %>%
+  group_by(ID) %>%
+  dplyr::arrange(week_num) %>%
+  mutate(home_h_dev = ifelse(gps_missing3, NA_real_, home_h_dev),
+         entropy_dev = ifelse(gps_missing3, NA_real_, entropy_dev),
+         travel_km_dev = ifelse(gps_missing3, NA_real_, travel_km_dev),
+         home_h_dev_lead1week = dplyr::lead(home_h_dev, n=1),
+         entropy_dev_lead1week = dplyr::lead(entropy_dev, n=1),
+         travel_km_dev_lead1week = dplyr::lead(travel_km_dev, n=1),
+         event_cat1_lead1week = dplyr::lead(event_cat1, n = 1),
+         ema_trigger_lead1week = dplyr::lead(ema_trigger, n = 1),
+         event_cat1_lead2week = dplyr::lead(event_cat1, n = 2),
+         ema_trigger_lead2week = dplyr::lead(ema_trigger, n = 2),
+         event_cat1_lead3week = dplyr::lead(event_cat1, n = 3),
+         ema_trigger_lead3week = dplyr::lead(ema_trigger, n = 3)) %>%
+  ungroup()
+
+
+riskdata_v4 %>%
+  group_by(riskOne, riskTwo, riskThree) %>%
+  count() %>%
+  dplyr::filter(riskTwo == 'yes' & riskThree == 'no' | riskOne %in% c('allTheTime', 'often'))
+
+
+events_check = data_weekly_with_stb %>%
+  dplyr::filter(!is.na(events)) %>%
+  dplyr::select(week_start_wednesday, ID) %>% 
+  distinct()
+
+events_type = data_weekly_with_stb %>%
+  dplyr::filter(!is.na(events)) %>%
+  dplyr::select(week_start_wednesday, ID, events) %>%
+  mutate(aborted = ifelse(grepl('aborted', events), 1, 0),
+         attempt = ifelse(grepl('attempt', events), 1, 0),
+         hospitalization = ifelse(grepl('hospitalization', events), 1, 0),
+         interrupted = ifelse(grepl('interrupted', events), 1, 0),
+         er = ifelse(grepl('ER', events), 1, 0))
+
+
+
+events_type %>% pivot_longer(c(aborted, attempt, hospitalization, er, interrupted)) %>%
+  group_by(name) %>%
+  summarise(count = sum(value))
+
+
+events_type 
+length(unique(events_check$ID))
+```
+
+
+```{r}
+### N of subjects and suicidal events in complete dataset:
+print(paste0("N of subjects:  ", length(unique(data_weekly_with_stb$ID))))
+
+
+mice::md.pattern(dplyr::select(data_weekly_with_stb, ID, home_h_dev, travel_km_dev, entropy_dev))
+```
+
+```{r}
+write.csv(data_weekly_with_stb, file = 'cleaned_data/weekly_data_with_stb.csv', row.names = FALSE)
+```

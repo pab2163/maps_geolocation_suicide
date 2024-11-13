@@ -1,0 +1,264 @@
+---
+title: "Data Vis & Models"
+author: "Ranqing Lan - updated Paul Bloom"
+date: "Created 2023-04-21, updated 2023-08-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(lme4)
+library(Matrix)
+library(lmerTest)
+library(brms)
+library(rstan)
+library(emmeans)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(crosstalk)
+library(shiny)
+library(DT)
+library(readxl,quietly=TRUE,warn.conflicts=FALSE)
+library(lubridate,quietly=TRUE,warn.conflicts=FALSE )
+library(zoo)
+library(psych)
+library(openxlsx)
+library(corrplot)
+library(sjmisc)
+library(sjlabelled)
+library(sjPlot)
+#library(coefplot2)
+library(glmmTMB)
+library(gridExtra)
+library(grid)
+library(ggplot2)
+options(scipen = 999)
+```
+
+# Pull Data In & Prep
+
+```{r, include = FALSE}
+df <- read_csv('cleaned_data/weekly_data_with_stb.csv') %>%
+  mutate(home_h_idmean = home_min_idmean/60)
+df_updated_homestay= read_csv('cleaned_data/weekly_data_with_stb_multihome.csv') %>%
+  mutate(home_h_idmean = home_min_idmean/60) %>%
+  dplyr::select(ID, week_start_wednesday, home_h_dev_either=home_h_dev, home_h_idmean_either = home_h_idmean)
+
+
+df = left_join(df, df_updated_homestay, by = c('ID', 'week_start_wednesday'))
+
+# week # check for schoolclosure
+df %>%
+  mutate(schoolclosure = dplyr::recode(schoolclosure, '1'='Closed (Remote Only)', '0'='Open (In-Person)'),
+         site = ifelse(startsWith(as.character(ID), '1'), 'New York City', 'Pittsburgh')) %>%
+  ggplot(data=., aes(x = week_start_wednesday, y = as.character(ID), fill = schoolclosure)) +
+  geom_tile() +
+  facet_grid(rows = vars(site), drop = TRUE, scales = 'free_y') +
+  theme_bw() +
+  theme(axis.text.y = element_blank()) +
+  labs(x = 'Date', y = 'Participants', fill = 'Local Public High School Status')
+
+
+## Grand mean scale geolocation features
+df <- df %>%
+  group_by(ID) %>%
+  mutate(
+    entropy_dev = scale(entropy_dev, center = FALSE, scale = TRUE),
+    home_h_dev = scale(home_h_dev, center = FALSE, scale = TRUE),
+    home_h_dev_either = scale(home_h_dev_either, center = FALSE, scale = TRUE),
+    travel_km_dev = scale(travel_km_dev, center = FALSE, scale = TRUE),
+  )
+```
+
+## Results {.tabset}
+
+### Within-participant GPS variable correlations
+
+```{r, include=FALSE}
+within_cors = df %>%
+  group_by(ID) %>%
+  summarise(`Travel Distance~Entropy` = cor(travel_km_dev, entropy_dev, use = 'pairwise.complete.obs'),
+            `Travel Distance~Homestay (EARS)` = cor(travel_km_dev, home_h_dev, use = 'pairwise.complete.obs'),
+            `Entropy~Homestay (EARS)` = cor(entropy_dev, home_h_dev, use = 'pairwise.complete.obs'),
+            `Travel Distance~Homestay (EARS+)` = cor(travel_km_dev, home_h_dev_either, use = 'pairwise.complete.obs'),
+            `Entropy~Homestay (EARS+)` = cor(entropy_dev, home_h_dev_either, use = 'pairwise.complete.obs'),
+            `Homestay (EARS)~Homestay (EARS+)` = cor(home_h_dev, home_h_dev_either, use = 'pairwise.complete.obs'))
+```
+
+#### Boxplot to visualize correlation distributions
+
+```{r}
+within_cor_plot = within_cors %>%
+  pivot_longer(contains('~')) %>%
+  ggplot(data = ., aes(x = name, y = value)) +
+  geom_hline(yintercept = 0, lty = 2, color = 'purple') +
+  geom_boxplot() +
+  coord_flip() + 
+  labs(y = 'Distribution of Within-Participant Correlations\nCalculated on Weekly Metrics', x= NULL) +
+  theme_bw()
+
+ggsave(within_cor_plot,
+       width = 7, height = 6,
+       file = 'plots/supplement/gps_measures_within_participant_correlations.png')
+```
+
+#### Means and standard deviations across participants in correlations
+
+```{r}
+within_cors %>%
+  pivot_longer(contains('~')) %>%
+  group_by(name) %>%
+  summarise(mean_correlation = mean(value, na.rm = TRUE),
+            sd_correlation = sd(value, na.rm=TRUE))
+```
+
+### Histograms
+
+
+#### Within-participant variables
+
+```{r}
+entropy_hist <- ggplot(df, aes(x= entropy_dev)) +
+  geom_histogram( color = "black", fill='red', alpha=1, position='identity') + theme_classic() + 
+  labs(x="Mean Daily Entropy\nAveraged Weekly & Within-Participant Mean-Centered", y = "Count", color = "black")
+
+
+# for homestay, 2 rows with histograms for the original EARS home location calculation + updated calculation
+homestay_hist <- ggplot(df %>%
+                              pivot_longer(contains('home_h_dev')) %>%
+                              dplyr::filter(!grepl('week', name)) %>%
+                          dplyr::mutate(name = recode(name, 'home_h_dev'='EARS', 'home_h_dev_either'='EARS+')),
+                             aes(x= value)) +
+  geom_histogram( color = "black", fill='gray', alpha=1, position='identity') + theme_classic() + 
+  stat_summary(aes(x = 0.1, y = value, xintercept = stat(y)), 
+               fun.y = mean, geom = "vline", lwd = 1, color = 'purple') +
+  labs(x="Mean Daily Homestay Hours\nAveraged Weekly & Within-Participant Mean-Centered", y = "Count", color = "black") +
+  facet_grid(rows = vars(name))
+
+
+travel_km_hist <- ggplot(df, aes(x= travel_km_dev)) +
+  geom_histogram( color = "black", fill='lightblue', alpha=1, position='identity') + theme_classic() +
+  labs(x="Mean Daily Distance (km) Traveled\nAveraged Weekly & Within-Participant Mean-Centered", y = "Count", color = "black")
+```
+
+#### Between-participant variables (participant means)
+
+```{r}
+# Just 1 row needed per person since we are looking at person-level averages
+btw_df = df %>%
+  group_by(ID) %>%
+  filter(row_number()==1)
+
+entropy_hist_mean <- ggplot(btw_df, aes(x= entropy_idmean)) +
+  geom_histogram( color = "black", fill='red', alpha=1, position='identity') + theme_classic() + 
+  labs(x="Mean Daily Entropy\nParticipant-Level Means", y = "Count", color = "black")
+
+# for homestay, 2 rows with histograms for the original EARS home location calculation + updated calculation
+homestay_mean_hist <- ggplot(btw_df %>%
+                              pivot_longer(contains('home_h_idmean')) %>%
+                              dplyr::filter(!grepl('week', name)) %>%
+                          dplyr::mutate(name = recode(name, 'home_h_idmean'='EARS', 'home_h_idmean_either'='EARS+')),
+                             aes(x= value)) +
+  geom_histogram( color = "black", fill='gray', alpha=1, position='identity') + theme_classic() + 
+  stat_summary(aes(x = 0.1, y = value, xintercept = stat(y)), 
+               fun.y = mean, geom = "vline", lwd = 1, color = 'purple') +
+  labs(x="Mean Daily Homestay Hours\nParticipant-Level Means", y = "Count", color = "black") +
+  facet_grid(rows = vars(name))
+
+travel_km_mean_hist <- ggplot(btw_df, aes(x= travel_km_mean)) +
+  geom_histogram( color = "black", fill='lightblue', alpha=1, position='identity') + theme_classic() +
+  labs(x="Mean Daily Distance (km) Traveled\nParticipant-Level Means", y = "Count", color = "black")
+
+```
+
+
+#### Comparison of EARS vs EARS+ homestay
+```{r}
+btw_df = mutate(btw_df, home_h_diff = home_h_idmean_either - home_h_idmean)
+m_ears_comp = lm(data = btw_df, home_h_diff ~ 1)
+tab_model(m_ears_comp, show.stat = TRUE, show.df = TRUE)
+summary(btw_df$home_h_idmean)
+sd(btw_df$home_h_idmean, na.rm=TRUE)
+
+summary(btw_df$home_h_idmean_either)
+sd(btw_df$home_h_idmean_either, na.rm=TRUE)
+```
+
+### 3. Missingness Plots
+
+
+```{r}
+missingness_gps <- df %>%
+  select(ID, week_num, gps_missing3) %>%
+  group_by(ID) %>%
+  mutate(data_collected0 = ifelse(gps_missing3==1, 0,1),
+         data_collected = as.factor(data_collected0),
+         sum_datacollected = sum(data_collected0, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(ID, desc(sum_datacollected)) %>%
+  mutate(data_collected = dplyr::recode(data_collected, '0' ='\u22642 Days With GPS Data Observed', '1'='\u22653 Days with GPS Data Observed')) %>% 
+  ggplot(data = ., aes(x = week_num, y = fct_reorder(.f = as.factor(ID), .x = sum_datacollected))) +
+  geom_tile(aes(fill = data_collected)) + 
+  labs(y = 'Participants', x = "Number of Weeks Following Baseline Visit", color = "Data Collected", color = "black", fill = NULL) +
+  ggtitle("A: Missingness of GPS Data") +
+  theme_linedraw() +
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = 'bottom') +
+  scale_x_continuous(expand = c(0, 0), limits = c(0,26))
+
+missingness_ema_trigger <- df %>%
+  select(ID, week_num, ema_trigger) %>%
+  group_by(ID) %>%
+  mutate(data_collected0 = ifelse(is.na(ema_trigger), 0,1),
+         data_collected = as.factor(data_collected0),
+         sum_datacollected = sum(data_collected0, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(ID, desc(sum_datacollected)) %>%
+  mutate(data_collected = dplyr::recode(data_collected, '0' ='Missing', '1'='Observed')) %>% 
+  ggplot(data = ., aes(x = week_num, y = fct_reorder(.f = as.factor(ID), .x = sum_datacollected))) +
+  geom_tile(aes(fill = data_collected)) + 
+  labs(y = 'Participants', x = "Number of Weeks Following Baseline Visit", color = "Data Collected", color = "black", fill = NULL) +
+  ggtitle("B: Missingness of Weekly STB Surveys") +
+  theme_linedraw() +
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = 'bottom') +
+  scale_x_continuous(expand = c(0, 0), limits = c(0,26))
+```
+
+
+```{r}
+gps_distributions_within = cowplot::plot_grid(entropy_hist, homestay_hist, travel_km_hist,
+                                       align = 'h', axis = 'bt',
+                   labels = c('A', 'B', 'C'))
+
+gps_distributions_within
+
+gps_distributions_btw = cowplot::plot_grid(entropy_hist_mean, homestay_mean_hist, travel_km_mean_hist,
+                                       align = 'h', axis = 'bt',
+                   labels = c('A', 'B', 'C'))
+
+gps_distributions_btw
+
+missingness_grid = cowplot::plot_grid(missingness_gps, missingness_ema_trigger)
+missingness_grid
+```
+
+
+#### Save plot files
+```{r}
+cowplot::save_plot(gps_distributions_within, filename = 'plots/supplement/gps_within_plot.png',
+                   base_width = 9, base_height = 5)
+
+
+cowplot::save_plot(gps_distributions_btw, filename = 'plots/supplement/gps_between_plot.png',
+                   base_width = 9, base_height = 5)
+
+
+cowplot::save_plot(missingness_grid, filename = 'plots/supplement/missing_data.png',
+                   base_width = 11, base_height = 4)
+```

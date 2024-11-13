@@ -1,0 +1,292 @@
+---
+title: "Explanatory Analyses With Imputation (Sensitivity)"
+author: "Ranqing Lan - updated Paul Bloom"
+date: "Created 2023-04-21, updated 2024-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(lme4)
+library(Matrix)
+library(lmerTest)
+library(brms)
+library(rstan)
+library(emmeans)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(crosstalk)
+library(shiny)
+library(DT)
+library(readxl,quietly=TRUE,warn.conflicts=FALSE)
+library(lubridate,quietly=TRUE,warn.conflicts=FALSE )
+library(zoo)
+library(psych)
+library(openxlsx)
+library(corrplot)
+library(sjmisc)
+library(sjlabelled)
+library(sjPlot)
+library(glmmTMB)
+library(gridExtra)
+library(grid)
+library(ggplot2)
+options(scipen = 999)
+library(purrr)
+library(broom)
+library(broom.mixed)
+library(mice)
+library(JointAI)
+```
+
+## Explanatory Analyses {.tabset}
+
+```{r}
+iter = 2000
+seed = 1
+set.seed(seed)
+```
+
+
+### MULTIPLE HOME LOCATION SETUP
+
+```{r, include = FALSE}
+df_multiple_locations <- read_csv('cleaned_data/weekly_data_with_stb_multihome.csv')
+
+## Standardize geolocation features
+df_multiple_locations <- df_multiple_locations %>%
+  group_by(ID) %>%
+  mutate(
+    entropy_dev = as.numeric(scale(entropy_dev, center = FALSE, scale = TRUE)),
+    home_h_dev = as.numeric(scale(home_h_dev, center = FALSE, scale = TRUE)),
+    travel_km_dev = as.numeric(scale(travel_km_dev, center = FALSE, scale = TRUE)),
+    entropy_dev_lead1week = as.numeric(scale(entropy_dev_lead1week, center = FALSE, scale = TRUE)),
+    home_h_dev_lead1week = as.numeric(scale(home_h_dev_lead1week, center = FALSE, scale = TRUE)),
+    travel_km_dev_lead1week = as.numeric(scale(travel_km_dev_lead1week, center = FALSE, scale = TRUE))) %>%
+  ungroup()
+
+# Bring in data for exclusions based on home distance
+homedist = read.csv('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/home_location/maps_home_distances_from_nyc_pitt.csv')
+df_multiple_locations = left_join(df_multiple_locations, dplyr::select(homedist, ID=subject_id, min_study_site_distance), by = 'ID')
+df_multiple_locations = mutate(df_multiple_locations, homedist_exclude = min_study_site_distance > 100)
+
+# join in self-report data
+load('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/Self_Report/data/self_report_02_07_2024.Rda')
+selfreport_v8 = mutate(selfreport_v8, SSI19_baseline_imp1month = coalesce(SSI19_i, SSI19_1),
+                       SSI19_baseline_imp1month = as.numeric(scale(SSI19_baseline_imp1month)),
+                       Control = ifelse(GROUP == 'Control',1, 0))
+
+df_multiple_locations = left_join(df_multiple_locations, selfreport_v8, by = 'ID')
+
+df_multiple_locations = mutate(df_multiple_locations,
+            home_h_idmean = scale(home_min_idmean/60),
+            entropy_idmean = scale(round(entropy_idmean, 3)),
+            travel_km_idmean = scale(round(travel_km_idmean, 3)),
+            home_h_idmean = scale(round(home_h_idmean, 3)))
+
+
+```
+
+# SINGLE HOME LOCATION SETUP
+
+```{r, include = FALSE}
+df_single_location <- read_csv('cleaned_data/weekly_data_with_stb.csv')
+
+b= df_single_location %>%
+  group_by(ID, home_min_idmean, travel_km_idmean, entropy_idmean) %>%
+  count()
+  
+## Standardize geolocation features
+df_single_location <- df_single_location %>%
+  group_by(ID) %>%
+  mutate(
+    entropy_dev = as.numeric(scale(entropy_dev, center = FALSE, scale = TRUE)),
+    home_h_dev = as.numeric(scale(home_h_dev, center = FALSE, scale = TRUE)),
+    travel_km_dev = as.numeric(scale(travel_km_dev, center = FALSE, scale = TRUE)),
+    entropy_dev_lead1week = as.numeric(scale(entropy_dev_lead1week, center = FALSE, scale = TRUE)),
+    home_h_dev_lead1week = as.numeric(scale(home_h_dev_lead1week, center = FALSE, scale = TRUE)),
+    travel_km_dev_lead1week = as.numeric(scale(travel_km_dev_lead1week, center = FALSE, scale = TRUE))) %>%
+  ungroup()
+
+# Bring in data for exclusions based on home distance
+homedist = read.csv('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/home_location/maps_home_distances_from_nyc_pitt.csv')
+df_single_location = left_join(df_single_location, dplyr::select(homedist, ID=subject_id, min_study_site_distance), by = 'ID')
+df_single_location = mutate(df_single_location, homedist_exclude = min_study_site_distance > 100)
+
+# join in self-report data
+load('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/Self_Report/data/self_report_02_07_2024.Rda')
+selfreport_v8 = mutate(selfreport_v8, SSI19_baseline_imp1month = coalesce(SSI19_i, SSI19_1),
+                       SSI19_baseline_imp1month = as.numeric(scale(SSI19_baseline_imp1month)),
+                       Control = ifelse(GROUP == 'Control',1, 0))
+df_single_location = left_join(df_single_location, selfreport_v8, by = 'ID')
+
+# remove weeks with fewer than 3 days with GPS
+sum(df_single_location$gps_missing3)
+
+df_single_location = mutate(df_single_location,
+            home_h_idmean = scale(home_min_idmean/60),
+            entropy_idmean = scale(round(entropy_idmean, 3)),
+            travel_km_idmean = scale(round(travel_km_idmean, 3)),
+            home_h_idmean = scale(round(home_h_idmean, 3)))
+
+```
+
+```{r}
+df_single_location$month = format(df_single_location$week_start_wednesday, "%m")
+df_single_location = mutate(df_single_location, summerbreak = ifelse(month %in% c('07', '09'), 1, 0))
+
+df_multiple_locations$month = format(df_multiple_locations$week_start_wednesday, "%m")
+df_multiple_locations = mutate(df_multiple_locations, summerbreak = ifelse(month %in% c('07', '09'), 1, 0))
+
+df_multiple_locations_for_imputation = df_multiple_locations %>%
+  mutate(sex = ifelse(sex == 'F', 1, 0),
+         SITE = ifelse(SITE=='CUIMC', 1, 0)) %>%
+  as.data.frame()
+
+df_single_location_for_imputation = df_single_location %>%
+  mutate(sex = ifelse(sex == 'F', 1, 0),
+         SITE = ifelse(SITE=='CUIMC', 1, 0)) %>%
+  as.data.frame()
+
+
+df_multiple_locations_for_imputation = mutate(df_multiple_locations_for_imputation, 
+                                              home_h_idmean = as.numeric(home_h_idmean),
+                                              entropy_idmean= as.numeric(entropy_idmean),
+                                              travel_km_idmean = as.numeric(travel_km_idmean))
+
+df_single_location_for_imputation = mutate(df_single_location_for_imputation, 
+                                              home_h_idmean = as.numeric(home_h_idmean),
+                                              entropy_idmean= as.numeric(entropy_idmean),
+                                              travel_km_idmean = as.numeric(travel_km_idmean))
+```
+
+
+
+#### EMA Triggers (Ideation)
+
+```{r}
+# imputation model using JointAI
+fit_ema_concurrent_imp = JointAI::glmer_imp(ema_trigger  ~ home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num, random = ~1|ID,
+                                          family = binomial,
+                                          models = c(home_h_dev = 'lmm',
+                                                     entropy_dev = 'lmm',
+                                                     travel_km_dev = 'lmm',
+                                                     ema_trigger = 'glmm_logit'),
+                                          data = df_multiple_locations_for_imputation,
+                                   n.iter = iter)
+
+fit_ema_concurrent = glmer(ema_trigger  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num + (1|ID) , data = df_multiple_locations,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+summary(fit_ema_concurrent)
+summary(fit_ema_concurrent_imp)
+
+
+exp(.438)
+c(exp(.0844), exp(.78306))
+
+```
+
+#### Suicide Events  
+
+
+```{r}
+fit_event_lead1week_1home = glmer(event_cat1_lead1week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num  + (1|ID),  data = df_single_location_for_imputation,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+
+fit_event_lead1week_multihome = glmer(event_cat1_lead1week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num  + (1|ID),  data = df_multiple_locations_for_imputation,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+
+# imputation
+fit_event_lead1week_imp_1home = JointAI::glmer_imp(event_cat1_lead1week  ~ home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num, random = ~1|ID,
+                                          family = binomial,
+                                          models = c(home_h_dev = 'lmm',
+                                                     entropy_dev = 'lmm',
+                                                     travel_km_dev = 'lmm',
+                                                     event_cat1_lead1week = 'glmm_logit'),
+                                          data = df_single_location_for_imputation,
+                                   n.iter = iter)
+
+
+
+fit_event_lead1week_imp_multihome = JointAI::glmer_imp(event_cat1_lead1week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num, random = ~1|ID,
+                                          family = binomial,
+                                          models = c(home_h_dev = 'lmm',
+                                                     entropy_dev = 'lmm',
+                                                     travel_km_dev = 'lmm',
+                                                     event_cat1_lead1week = 'glmm_logit'),
+                                          data = df_multiple_locations_for_imputation,
+                                   n.iter = iter)
+
+output_event_lead1week_imp_1home = summary(fit_event_lead1week_imp_1home)$res$event_cat1_lead1week$regcoef %>%
+  as.data.frame() %>%
+  mutate(term = row.names(.), model = '1 Home Location + Imputation') %>%
+  dplyr::select(estimate=Mean, conf.low=`2.5%`, conf.high=`97.5%`, term, model)
+
+output_event_lead1week_imp_multihome = summary(fit_event_lead1week_imp_multihome)$res$event_cat1_lead1week$regcoef %>%
+  as.data.frame() %>%
+  mutate(term = row.names(.), model = 'Multiple Home Locations + Imputation') %>%
+  dplyr::select(estimate=Mean, conf.low=`2.5%`, conf.high=`97.5%`, term, model)
+
+output_event_lead1week_1home = broom.mixed::tidy(fit_event_lead1week_1home, conf.int=TRUE) %>%
+  mutate(model = '1 Home Location (Main Manuscript)')
+
+output_event_lead1week_multihome = broom.mixed::tidy(fit_event_lead1week_multihome, conf.int=TRUE) %>%
+  mutate(model = 'Multiple Home Locations')
+
+
+outputs_multi = plyr::rbind.fill(output_event_lead1week_imp_1home, output_event_lead1week_imp_multihome,
+                                 output_event_lead1week_1home, output_event_lead1week_multihome) %>%
+  dplyr::filter(grepl('dev', term))
+
+
+
+save(outputs_multi, file = 'model_outputs/outputs_multiverse_imputation.rda')
+
+outputs_multi = mutate(outputs_multi, estimate = exp(estimate),
+                       conf.low = exp(conf.low),
+                       conf.high = exp(conf.high),
+                       term = dplyr::recode(term, 'entropy_dev'='Entropy',
+                                            'home_h_dev'='Homestay',
+                                            'travel_km_dev'='Distance Traveled'),
+                       sig_star = case_when(
+                         conf.low < 1 & conf.high < 1 ~ '*',
+                         conf.low > 1 & conf.high > 1 ~ '*',
+                       ))
+
+
+colors = c("lightblue", "red","black")
+
+supplemental_multiverse_plot = ggplot(outputs_multi, aes(x = model, y = estimate, color = term)) +
+  geom_point(position = position_dodge(width = 0.1), size = 2) +
+  geom_errorbar(aes(ymin=conf.low, ymax = conf.high), width = 0, position = position_dodge(width = 0.1), lwd = 1) +
+  geom_text(aes(y = conf.high*1.05, label = sig_star)) +
+  facet_grid(rows = vars(term), scales = 'free_y', drop = TRUE) +
+  geom_hline(yintercept = 1, lty = 2) +
+  scale_y_log10() +
+  coord_flip() +
+  theme_bw() +
+  labs(y = 'Ajusted Odds Ratio', x = 'Analysis Specification') +
+  scale_color_manual(values = colors) +
+  theme(legend.position = 'none')
+
+
+ggsave(supplemental_multiverse_plot, file = 'plots/supplement/multiverse_multihome_imputation_event_plot.png',
+       height = 6, width = 6)
+
+```

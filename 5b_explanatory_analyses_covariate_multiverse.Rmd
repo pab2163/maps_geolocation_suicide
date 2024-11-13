@@ -1,0 +1,349 @@
+---
+title: "Covariate Multiverse Sensitivity Analysis for Explanatory Models"
+author: "Ranqing Lan - updated Paul Bloom"
+date: "Created 2023-04-21, updated 2024-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(lme4)
+library(Matrix)
+library(lmerTest)
+library(brms)
+library(rstan)
+library(emmeans)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(crosstalk)
+library(shiny)
+library(DT)
+library(readxl,quietly=TRUE,warn.conflicts=FALSE)
+library(lubridate,quietly=TRUE,warn.conflicts=FALSE )
+library(zoo)
+library(psych)
+library(openxlsx)
+library(corrplot)
+library(sjmisc)
+library(sjlabelled)
+library(sjPlot)
+library(glmmTMB)
+library(gridExtra)
+library(grid)
+library(ggplot2)
+options(scipen = 999)
+library(purrr)
+library(broom)
+library(broom.mixed)
+library(mice)
+library(specr)
+```
+
+## Explanatory Analyses {.tabset}
+
+```{r}
+iter = 2000
+seed = 1
+set.seed(seed)
+```
+
+
+### MULTIPLE HOME LOCATION SETUP
+
+```{r, include = FALSE}
+df_multiple_locations <- read_csv('cleaned_data/weekly_data_with_stb_multihome.csv')
+
+## Standardize geolocation features
+df_multiple_locations <- df_multiple_locations %>%
+  group_by(ID) %>%
+  mutate(
+    entropy_dev = as.numeric(scale(entropy_dev, center = FALSE, scale = TRUE)),
+    home_h_dev = as.numeric(scale(home_h_dev, center = FALSE, scale = TRUE)),
+    travel_km_dev = as.numeric(scale(travel_km_dev, center = FALSE, scale = TRUE)),
+    entropy_dev_lead1week = as.numeric(scale(entropy_dev_lead1week, center = FALSE, scale = TRUE)),
+    home_h_dev_lead1week = as.numeric(scale(home_h_dev_lead1week, center = FALSE, scale = TRUE)),
+    travel_km_dev_lead1week = as.numeric(scale(travel_km_dev_lead1week, center = FALSE, scale = TRUE))) %>%
+  ungroup()
+
+# Bring in data for exclusions based on home distance
+homedist = read.csv('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/home_location/maps_home_distances_from_nyc_pitt.csv')
+df_multiple_locations = left_join(df_multiple_locations, dplyr::select(homedist, ID=subject_id, min_study_site_distance), by = 'ID')
+df_multiple_locations = mutate(df_multiple_locations, homedist_exclude = min_study_site_distance > 100)
+
+# join in self-report data
+load('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/Self_Report/data/self_report_02_07_2024.Rda')
+selfreport_v8 = mutate(selfreport_v8, SSI19_baseline_imp1month = coalesce(SSI19_i, SSI19_1),
+                       SSI19_baseline_imp1month = as.numeric(scale(SSI19_baseline_imp1month)),
+                       Control = ifelse(GROUP == 'Control',1, 0))
+
+df_multiple_locations = left_join(df_multiple_locations, selfreport_v8, by = 'ID')
+
+df_multiple_locations = mutate(df_multiple_locations,
+            home_h_idmean = scale(home_min_idmean/60),
+            entropy_idmean = scale(round(entropy_idmean, 3)),
+            travel_km_idmean = scale(round(travel_km_idmean, 3)),
+            home_h_idmean = scale(round(home_h_idmean, 3)))
+
+
+```
+
+# SINGLE HOME LOCATION SETUP
+
+```{r, include = FALSE}
+df_single_location <- read_csv('cleaned_data/weekly_data_with_stb.csv')
+
+b= df_single_location %>%
+  group_by(ID, home_min_idmean, travel_km_idmean, entropy_idmean) %>%
+  count()
+  
+## Standardize geolocation features
+df_single_location <- df_single_location %>%
+  group_by(ID) %>%
+  mutate(
+    entropy_dev = as.numeric(scale(entropy_dev, center = FALSE, scale = TRUE)),
+    home_h_dev = as.numeric(scale(home_h_dev, center = FALSE, scale = TRUE)),
+    travel_km_dev = as.numeric(scale(travel_km_dev, center = FALSE, scale = TRUE)),
+    entropy_dev_lead1week = as.numeric(scale(entropy_dev_lead1week, center = FALSE, scale = TRUE)),
+    home_h_dev_lead1week = as.numeric(scale(home_h_dev_lead1week, center = FALSE, scale = TRUE)),
+    travel_km_dev_lead1week = as.numeric(scale(travel_km_dev_lead1week, center = FALSE, scale = TRUE))) %>%
+  ungroup()
+
+# Bring in data for exclusions based on home distance
+homedist = read.csv('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/home_location/maps_home_distances_from_nyc_pitt.csv')
+df_single_location = left_join(df_single_location, dplyr::select(homedist, ID=subject_id, min_study_site_distance), by = 'ID')
+df_single_location = mutate(df_single_location, homedist_exclude = min_study_site_distance > 100)
+
+# join in self-report data
+load('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/Self_Report/data/self_report_02_07_2024.Rda')
+selfreport_v8 = mutate(selfreport_v8, SSI19_baseline_imp1month = coalesce(SSI19_i, SSI19_1),
+                       SSI19_baseline_imp1month = as.numeric(scale(SSI19_baseline_imp1month)),
+                       Control = ifelse(GROUP == 'Control',1, 0))
+df_single_location = left_join(df_single_location, selfreport_v8, by = 'ID')
+
+# remove weeks with fewer than 3 days with GPS
+sum(df_single_location$gps_missing3)
+
+df_single_location = mutate(df_single_location,
+            home_h_idmean = scale(home_min_idmean/60),
+            entropy_idmean = scale(round(entropy_idmean, 3)),
+            travel_km_idmean = scale(round(travel_km_idmean, 3)),
+            home_h_idmean = scale(round(home_h_idmean, 3)))
+
+```
+
+```{r}
+df_single_location$month = format(df_single_location$week_start_wednesday, "%m")
+df_single_location = mutate(df_single_location, summerbreak = ifelse(month %in% c('07', '09'), 1, 0))
+
+df_multiple_locations$month = format(df_multiple_locations$week_start_wednesday, "%m")
+df_multiple_locations = mutate(df_multiple_locations, summerbreak = ifelse(month %in% c('07', '09'), 1, 0))
+
+df_multiple_locations_for_imputation = df_multiple_locations %>%
+  mutate(sex = ifelse(sex == 'F', 1, 0),
+         SITE = ifelse(SITE=='CUIMC', 1, 0)) %>%
+  as.data.frame()
+
+df_single_location_for_imputation = df_single_location %>%
+  mutate(sex = ifelse(sex == 'F', 1, 0),
+         SITE = ifelse(SITE=='CUIMC', 1, 0)) %>%
+  as.data.frame()
+
+
+df_multiple_locations_for_imputation = mutate(df_multiple_locations_for_imputation, 
+                                              home_h_idmean = as.numeric(home_h_idmean),
+                                              entropy_idmean= as.numeric(entropy_idmean),
+                                              travel_km_idmean = as.numeric(travel_km_idmean))
+
+df_single_location_for_imputation = mutate(df_single_location_for_imputation, 
+                                              home_h_idmean = as.numeric(home_h_idmean),
+                                              entropy_idmean= as.numeric(entropy_idmean),
+                                              travel_km_idmean = as.numeric(travel_km_idmean))
+```
+
+
+# Covariate multiverse setup
+
+```{r}
+glmer_model_random_intercept <- function(formula, data,...) {
+  require(lme4)
+  require(broom.mixed)
+  # set up the model base formula (basically specr will past all other model info in here)
+  formula <- paste(formula, "+ week_num + (1|ID)")
+  lme4::glmer(formula, data, family = binomial(link='logit'),control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+}
+
+
+control_vars_homestay =  c('entropy_dev', 'travel_km_dev', 'home_h_idmean', 'travel_km_idmean', 'entropy_idmean', 
+                           'schoolclosure', 'sex', 'SITE', 'iPhone', 'age', 'SSI19_baseline_imp1month', 'summerbreak')
+control_vars_entropy =  c('home_h_dev', 'travel_km_dev', 'home_h_idmean', 'travel_km_idmean', 'entropy_idmean', 
+                           'schoolclosure', 'sex', 'SITE', 'iPhone', 'age', 'SSI19_baseline_imp1month', 'summerbreak')
+control_vars_traveldist =  c('entropy_dev', 'home_h_dev', 'home_h_idmean', 'travel_km_idmean', 'entropy_idmean', 
+                           'schoolclosure', 'sex', 'SITE', 'iPhone', 'age', 'SSI19_baseline_imp1month', 'summerbreak')
+
+
+control_vars_test = c('sex', 'age')
+
+homestay_setup= specr::setup(data = df_single_location_for_imputation,
+                         x = c('home_h_dev'),
+                         y = c('event_cat1_lead1week', 'ema_trigger_lead1week'),
+                         controls = control_vars_homestay,
+                         simplify = FALSE,
+                         model = c('glmer_model_random_intercept'))
+
+entropy_setup= specr::setup(data = df_single_location_for_imputation,
+                         x = c('entropy_dev'),
+                         y = c('event_cat1_lead1week', 'ema_trigger_lead1week'),
+                         controls = control_vars_entropy,
+                         simplify = FALSE,
+                         model = c('glmer_model_random_intercept'))
+
+traveldist_setup= specr::setup(data = df_single_location_for_imputation,
+                         x = c('travel_km_dev'),
+                         y = c('event_cat1_lead1week', 'ema_trigger_lead1week'),
+                         controls = control_vars_traveldist,
+                         simplify = FALSE,
+                         model = c('glmer_model_random_intercept'))
+```
+
+
+# Slow step - run multiverses!
+```{r homestay_multi1}
+specs_homestay = specr::specr(homestay_setup)
+```
+
+```{r entropy_multi2}
+specs_entropy = specr::specr(entropy_setup)
+```
+
+```{r traveldist_multi3}
+specs_traveldist = specr::specr(traveldist_setup)
+```
+
+```{r}
+save(specs_homestay, specs_entropy, specs_traveldist, file = 'model_outputs/covariate_multiverses_nextweek.rda')
+```
+
+# Plotting
+
+```{r}
+make_spec_curve_plot = function(spec_df, choices_vec, input_y, input_title){
+  
+  # for some reason, this run in specr didn't capture convergence stats, but there are a very few models (<10/multiverse) that very likely didn't converge - removing them based on improbable stats here 
+  spec_df = dplyr::filter(spec_df, abs(statistic) < 7)
+  
+  spec_df = spec_df %>%
+    mutate(
+         sex = ifelse(grepl('sex', controls), 'Sex+', 'Sex-'),
+         site = ifelse(grepl('SITE', controls), 'Site+', 'Site-'),
+         device = ifelse(grepl('iPhone', controls), 'Device+', 'Device-'),
+         age = ifelse(grepl('age', controls), 'Age+', 'Age-'),
+         schoolclosure = ifelse(grepl('schoolclosure', controls), 'Scool Closure+', 'SchoolClosure-'),
+         si = ifelse(grepl('SSI19_baseline_imp1month', controls), 'Baseline SI+', 'Baseline SI-'),
+         summerbreak = ifelse(grepl('summerbreak', controls), 'Summer Break+', 'Summer Break-'),
+         entropy_w = ifelse(grepl('entropy_dev', controls), 'Entropy (within)+', 'Entropy (within)-'),
+         homestay_w = ifelse(grepl('home_h_dev', controls), 'Homestay (within)+', 'Homestay (within)-'),
+         traveldist_w = ifelse(grepl('travel_km_dev', controls), 'Travel Distance (within)+', 'Travel Distance (within)-'),
+         entropy_b = ifelse(grepl('entropy_idmean', controls), 'Entropy (between)+', 'Entropy (between)-'),
+         homestay_b = ifelse(grepl('home_h_idmean', controls), 'Homestay (between)+', 'Homestay (between)-'),
+         traveldist_b = ifelse(grepl('travel_km_idmean', controls), 'Travel Distance (between)+', 'Travel Distance (between)-'))
+  
+  top = specr::plot_curve(spec_df) +
+    labs(y = input_y, title = input_title) +
+    geom_hline(yintercept = 0, lty = 2)
+  bottom = specr::plot_choices(spec_df, choices = choices_vec) +
+    theme(strip.text = element_blank()) +
+    labs(x = 'Model Specifications Ordered by Effect Size')
+
+  full = cowplot::plot_grid(top, bottom, nrow = 2, align = 'v', axis = 'lr', 
+                            rel_heights = c(1, 1.5))
+
+  
+  return(full)
+}
+```
+
+```{r}
+load('model_outputs/covariate_multiverses_nextweek.rda')
+```
+
+# Homestay
+```{r}
+specs_homestay_events = specs_homestay$data %>% dplyr::filter(y == 'event_cat1_lead1week')
+specs_homestay_si = specs_homestay$data %>% dplyr::filter(y == 'ema_trigger_lead1week')
+
+sum(specs_homestay_events$conf.low > 0) / nrow(specs_homestay_events)
+
+
+plt_homestay_events = make_spec_curve_plot(specs_homestay_events, 
+                     choices = c('sex', 'site', 'device', 'age', 'schoolclosure', 'si', 'summerbreak', 
+                                 'entropy_w', 'traveldist_w', 'entropy_b', 'homestay_b', 'traveldist_b'),
+                     input_y = 'Beta Estimate\nLog Odds', 
+                     input_title = 'Multiverse Sensitivity Analysis:\nAssociations Between Homestay & Next-Week Suicidal Events')
+
+
+plt_homestay_si = make_spec_curve_plot(specs_homestay_si, 
+                     choices = c('sex', 'site', 'device', 'age', 'schoolclosure', 'si', 'summerbreak', 
+                                 'entropy_w', 'traveldist_w', 'entropy_b', 'homestay_b', 'traveldist_b'),
+                     input_y = 'Beta Estimate\nLog Odds', 
+                     input_title = 'Multiverse Sensitivity Analysis:\nAssociations Between Homestay & Next-Week Suicidal Ideation')
+
+cowplot::save_plot(plt_homestay_events, filename = 'plots/supplement/covariate_multiverse_homestay_events.png',
+                   base_height = 8, base_width = 10)
+
+cowplot::save_plot(plt_homestay_si, filename = 'plots/supplement/covariate_multiverse_homestay_si.png',
+                   base_height = 8, base_width = 10)
+```
+
+# Entropy
+```{r}
+specs_entropy_events = specs_entropy$data %>% dplyr::filter(y == 'event_cat1_lead1week')
+specs_entropy_si = specs_entropy$data %>% dplyr::filter(y == 'ema_trigger_lead1week')
+
+
+plt_entropy_events=make_spec_curve_plot(specs_entropy_events, 
+                     choices = c('sex', 'site', 'device', 'age', 'schoolclosure', 'si', 'summerbreak', 
+                                 'homestay_w', 'traveldist_w', 'entropy_b', 'homestay_b', 'traveldist_b'),
+                     input_y = 'Beta Estimate\nLog Odds', 
+                     input_title = 'Multiverse Sensitivity Analysis:\nAssociations Between Entropy & Next-Week Suicidal Events')
+
+
+plt_entropy_si = make_spec_curve_plot(specs_entropy_si, 
+                     choices = c('sex', 'site', 'device', 'age', 'schoolclosure', 'si', 'summerbreak', 
+                                 'homestay_w', 'traveldist_w', 'entropy_b', 'homestay_b', 'traveldist_b'),
+                     input_y = 'Beta Estimate\nLog Odds', 
+                     input_title = 'Multiverse Sensitivity Analysis:\nAssociations Between Entropy & Next-Week Suicidal Ideation')
+
+cowplot::save_plot(plt_entropy_events, filename = 'plots/supplement/covariate_multiverse_entropy_events.png',
+                   base_height = 8, base_width = 10)
+
+cowplot::save_plot(plt_entropy_si, filename = 'plots/supplement/covariate_multiverse_entropy_si.png',
+                   base_height = 8, base_width = 10)
+```
+
+# Travel Distance
+```{r}
+specs_traveldist_events = specs_traveldist$data %>% dplyr::filter(y == 'event_cat1_lead1week')
+specs_traveldist_si = specs_traveldist$data %>% dplyr::filter(y == 'ema_trigger_lead1week')
+
+
+plt_traveldist_events = make_spec_curve_plot(specs_traveldist_events, 
+                     choices = c('sex', 'site', 'device', 'age', 'schoolclosure', 'si', 'summerbreak', 
+                                 'homestay_w', 'entropy_w', 'entropy_b', 'homestay_b', 'traveldist_b'),
+                     input_y = 'Beta Estimate\nLog Odds', 
+                     input_title = 'Multiverse Sensitivity Analysis:\nAssociations Between Travel Distance & Next-Week Suicidal Events')
+
+
+plt_traveldist_si = make_spec_curve_plot(specs_traveldist_si, 
+                     choices = c('sex', 'site', 'device', 'age', 'schoolclosure', 'si', 'summerbreak', 
+                                 'homestay_w', 'entropy_w', 'entropy_b', 'homestay_b', 'traveldist_b'),
+                     input_y = 'Beta Estimate\nLog Odds', 
+                     input_title = 'Multiverse Sensitivity Analysis:\nAssociations Between Travel Distance & Next-Week Suicidal Ideation')
+
+cowplot::save_plot(plt_traveldist_events, filename = 'plots/supplement/covariate_multiverse_traveldist_events.png',
+                   base_height = 8, base_width = 10)
+
+cowplot::save_plot(plt_traveldist_si, filename = 'plots/supplement/covariate_multiverse_traveldist_si.png',
+                   base_height = 8, base_width = 10)
+```
+

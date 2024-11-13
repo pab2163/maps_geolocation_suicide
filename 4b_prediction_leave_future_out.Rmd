@@ -1,0 +1,448 @@
+---
+title: "Prediction/Validation Within Participants (Leave Future Out)"
+author: "Ranqing Lan, Paul Bloom Updated 2024-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(lme4)
+library(Matrix)
+library(lmerTest)
+library(brms)
+library(rstan)
+library(emmeans)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(crosstalk)
+library(shiny)
+library(DT)
+library(readxl,quietly=TRUE,warn.conflicts=FALSE)
+library(lubridate,quietly=TRUE,warn.conflicts=FALSE )
+library(zoo)
+library(psych)
+library(openxlsx)
+library(sjmisc)
+library(sjlabelled)
+library(sjPlot)
+library(gridExtra)
+library(grid)
+library(ggplot2)
+library(caret)
+library(pROC)
+require(compiler)
+require(parallel)
+require(boot)
+require(lattice)
+library(glmmTMB)
+rm(list=ls())
+```
+
+# Pull in data
+```{r, include = FALSE}
+data_agg <- read_csv("/Volumes/columbia/MAPS_Data/Ranqing/MAPS_suicidal_behavior/scripts_rev1/cleaned_data/weekly_data_with_stb.csv", show_col_types = FALSE)
+
+## standardize geolocation features
+df = data_agg
+
+# join in self-report data
+load('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/Self_Report/data/self_report_02_07_2024.Rda')
+selfreport_v8 = mutate(selfreport_v8, SSI19_baseline_imp1month = coalesce(SSI19_i, SSI19_1))
+df = left_join(df, selfreport_v8, by = 'ID')
+
+# remove weeks with fewer than 3 days with GPS
+df = dplyr::filter(df, !gps_missing3)
+```
+
+# Data splitting & scaling
+
+```{r}
+baseclinical <- c("SSI19_baseline_imp1month")
+geomatrix <- c('travel_km_dev', 'home_min_dev' , 'entropy_dev')
+demo <- c("sex" , "age" ,"SITE", "iPhone") 
+time <- "week_num"
+
+# Split data for validation - train on first half of weeks and test on second half of weeks for all participants
+df_for_validation = dplyr::select(df, ID, week_num, event_cat1_lead1week, event_cat1_lead1week, ema_trigger_lead1week, ema_trigger_lead1week, 
+                   all_of(baseclinical), all_of(geomatrix), all_of(demo), all_of(time))
+  
+df_for_validation_na = na.omit(df_for_validation)
+
+df_for_validation = df_for_validation %>%
+  group_by(ID) %>%
+  mutate(week_num_cutoff = quantile(week_num, 0.5)) %>%
+  ungroup()
+
+train_df_for_validation0 <- df_for_validation %>%
+  arrange(ID, week_num) %>%
+  group_by(ID) %>%
+  slice(seq(0.5 * n()))
+
+test_df_for_validation0 <- setdiff(df_for_validation, train_df_for_validation0)
+
+## Scale test set based on training set
+preproc <- preProcess(train_df_for_validation0[geomatrix], method = c("scale"))
+train_df_for_validation <- predict(preproc, train_df_for_validation0)
+train_df_for_validation <- train_df_for_validation %>% ungroup()
+
+test_df_for_validation0 <- test_df_for_validation0 %>% group_by(ID)
+test_df_for_validation <- predict(preproc, test_df_for_validation0)
+test_df_for_validation <- test_df_for_validation %>% ungroup()
+
+
+
+sum(train_df_for_validation$event_cat1_lead1week, na.rm = TRUE)
+sum(test_df_for_validation$event_cat1_lead1week, na.rm = TRUE)
+```
+
+## Results {.tabset}
+
+### STB only
+
+```{r}
+fit_cat1_base <- glmer(event_cat1_lead1week ~ 1 +  (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_cat1_demo <- glmer(event_cat1_lead1week ~ SSI19_baseline_imp1month + sex + SITE + age + iPhone +  (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_cat1_si <- glmer(event_cat1_lead1week ~ SSI19_baseline_imp1month + (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_cat1_all <- glmer(event_cat1_lead1week ~ home_min_dev + entropy_dev + travel_km_dev  + 
+                        SSI19_baseline_imp1month + sex + SITE + age + iPhone + (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_cat1_geo <- glmer(event_cat1_lead1week ~ home_min_dev + entropy_dev + travel_km_dev + (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_cat1_homestay <- glmer(event_cat1_lead1week ~ home_min_dev + (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_cat1_demo_homestay <- glmer(event_cat1_lead1week ~ SSI19_baseline_imp1month + sex + SITE + age + iPhone + home_min_dev +(1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+```
+
+
+### Triggers only
+
+```{r}
+fit_thought_base <- glmer(ema_trigger_lead1week ~ 1 +  (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_thought_demo <- glmer(ema_trigger_lead1week ~ SSI19_baseline_imp1month + sex + SITE + age + iPhone +  (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_thought_si <- glmer(ema_trigger_lead1week ~ SSI19_baseline_imp1month + (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_thought_all <- glmer(ema_trigger_lead1week ~ home_min_dev + entropy_dev + travel_km_dev  + SSI19_baseline_imp1month + sex + SITE + age + iPhone +  (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_thought_geo <- glmer(ema_trigger_lead1week ~ home_min_dev + entropy_dev + travel_km_dev + (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_thought_homestay <- glmer(ema_trigger_lead1week ~ home_min_dev + (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_thought_demo_homestay <- glmer(ema_trigger_lead1week ~ SSI19_baseline_imp1month + home_min_dev + sex + SITE + age + iPhone +  (1|ID) , data = train_df_for_validation, 
+              family = binomial,  control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+```
+
+
+### Gather model metrics & put into a table
+```{r}
+# function to capture sensitivity and specificity metrics given predictions and real values
+custom_sensitivity_specificity = function(preds_values, real_values){
+  tp = sum(preds_values == 1 & real_values == 1, na.rm = TRUE)
+  tn = sum(preds_values == 0 & real_values == 0, na.rm = TRUE)
+  fp = sum(preds_values == 1 & real_values == 0, na.rm = TRUE)
+  fn = sum(preds_values == 0 & real_values == 1, na.rm = TRUE)
+
+  sens = tp/(tp+fn)
+  spec = tn/(tn+fp)
+  ppv = tp/(tp + fp)
+  
+  return(list('sensitivity'=sens, 'specificity'=spec, 'ppv'=ppv))
+}
+
+```
+
+#### EMA Trigger Model Metrics
+```{r}
+threshold_ema = sum(df_for_validation$ema_trigger_lead1week, na.rm = TRUE) / sum(!is.na(df_for_validation$ema_trigger_lead1week))
+
+ema_trigger_modeldf = data.frame(model = I(list(fit_thought_base, fit_thought_demo, fit_thought_geo, fit_thought_all, fit_thought_homestay, fit_thought_demo_homestay, fit_thought_si)),
+                                model_name = c('Intercepts Only', 'Baseline Features', 'Geolocation', 'Baseline + Geolocation Features', 'Homestay', 'Baseline Features + Homestay', 'Baseline SI Only'))
+
+
+ema_trigger_modeldf = ema_trigger_modeldf %>%
+  mutate(auc_train = purrr::map(model, ~auc(roc(train_df_for_validation$ema_trigger_lead1week, predict(., train_df_for_validation, type="response", re.form=NA)))),
+         auc_test = purrr::map(model, ~auc(roc(test_df_for_validation$ema_trigger_lead1week, predict(., test_df_for_validation, type="response", re.form=NA)))),
+         auc.lwr_test=purrr::map(model, ~pROC::ci.auc(test_df_for_validation$ema_trigger_lead1week, predict(., test_df_for_validation, type="response", re.form=NA))[1]),
+         auc.upr_test=purrr::map(model, ~pROC::ci.auc(test_df_for_validation$ema_trigger_lead1week, predict(., test_df_for_validation, type="response", re.form=NA))[3]),
+         sensitivity_train = purrr::map(model, ~custom_sensitivity_specificity(
+           preds_values = ifelse(predict(., train_df_for_validation, type="response", re.form=NA) > threshold_ema,1,0),
+           real_values = train_df_for_validation$ema_trigger_lead1week)$sensitivity),
+         specificity_train = purrr::map(model, ~custom_sensitivity_specificity(
+           preds_values = ifelse(predict(., train_df_for_validation, type="response", re.form=NA) > threshold_ema,1,0),
+           real_values = train_df_for_validation$ema_trigger_lead1week)$specificity),
+         sensitivity_test = purrr::map(model, ~custom_sensitivity_specificity(
+           preds_values = ifelse(predict(., test_df_for_validation, type="response", re.form=NA) > threshold_ema,1,0),
+           real_values = test_df_for_validation$ema_trigger_lead1week)$sensitivity),
+         specificity_test = purrr::map(model, ~custom_sensitivity_specificity(
+           preds_values = ifelse(predict(., test_df_for_validation, type="response", re.form=NA) > threshold_ema,1,0),
+           real_values = test_df_for_validation$ema_trigger_lead1week)$specificity),
+         ppv_test = purrr::map(model, ~custom_sensitivity_specificity(
+           preds_values = ifelse(predict(., test_df_for_validation, type="response", re.form=NA) > threshold_ema,1,0),
+           real_values = test_df_for_validation$ema_trigger_lead1week)$ppv))
+                                       
+                                       
+                                       
+outputs_thought = ema_trigger_modeldf %>%
+  dplyr::select(-model) %>%
+  pivot_longer(-model_name, names_sep = '_', names_to = c('measure', 'time')) %>%
+  mutate(value = round(as.numeric(value), 3)) %>%
+  pivot_wider(id_cols = c('model_name', 'time'), values_from = 'value', names_from = 'measure')
+```
+
+
+#### Suicide Event Model Metrics
+```{r}
+threshold_event = sum(df_for_validation$event_cat1_lead1week, na.rm = TRUE) / sum(!is.na(df_for_validation$event_cat1_lead1week))
+
+
+event_cat1_modeldf = data.frame(model = I(list(fit_cat1_base, fit_cat1_demo, fit_cat1_geo, fit_cat1_all, fit_cat1_homestay, fit_cat1_demo_homestay, fit_cat1_si)),
+                                model_name = c('Intercepts Only', 'Baseline Features', 'Geolocation', 'Baseline + Geolocation Features', 'Homestay', 'Baseline Features + Homestay', 'Baseline SI Only'))
+
+event_cat1_modeldf = event_cat1_modeldf %>%
+  mutate(auc_train = purrr::map(model, ~ auc(roc(train_df_for_validation$event_cat1_lead1week, 
+                                                 predict(., train_df_for_validation, type="response", re.form=NA)))),
+         auc_test = purrr::map(model, ~ auc(roc(test_df_for_validation$event_cat1_lead1week, 
+                                                predict(., test_df_for_validation, type="response", re.form=NA)))),
+         auc.lwr_test=purrr::map(model, ~pROC::ci.auc(test_df_for_validation$event_cat1_lead1week, 
+                                                      predict(., test_df_for_validation, type="response", re.form=NA))[1]),
+         auc.upr_test=purrr::map(model, ~pROC::ci.auc(test_df_for_validation$event_cat1_lead1week, 
+                                                      predict(., test_df_for_validation, type="response", re.form=NA))[3]),
+         sensitivity_train = purrr::map(model, ~custom_sensitivity_specificity(
+           preds_values = ifelse(predict(., train_df_for_validation, type="response", re.form=NA) > threshold_event,1,0),
+           real_values = train_df_for_validation$event_cat1_lead1week)$sensitivity),
+         specificity_train = purrr::map(model, ~custom_sensitivity_specificity(
+           preds_values = ifelse(predict(., train_df_for_validation, type="response", re.form=NA) > threshold_event,1,0),
+           real_values = train_df_for_validation$event_cat1_lead1week)$specificity),
+         sensitivity_test = purrr::map(model, ~custom_sensitivity_specificity(
+           preds_values = ifelse(predict(., test_df_for_validation, type="response", re.form=NA) > threshold_event,1,0),
+           real_values = test_df_for_validation$event_cat1_lead1week)$sensitivity),
+         specificity_test = purrr::map(model, ~custom_sensitivity_specificity(
+           preds_values = ifelse(predict(., test_df_for_validation, type="response", re.form=NA) > threshold_event,1,0),
+           real_values = test_df_for_validation$event_cat1_lead1week)$specificity),
+         ppv_test = purrr::map(model, ~custom_sensitivity_specificity(
+           preds_values = ifelse(predict(., test_df_for_validation, type="response", re.form=NA) > threshold_event,1,0),
+           real_values = test_df_for_validation$event_cat1_lead1week)$ppv))
+                                       
+                                       
+                                       
+outputs_cat1 = event_cat1_modeldf %>%
+  dplyr::select(-model) %>%
+  pivot_longer(-model_name, names_sep = '_', names_to = c('measure', 'time')) %>%
+  mutate(value = round(as.numeric(value), 3)) %>%
+  pivot_wider(id_cols = c('model_name', 'time'), values_from = 'value', names_from = 'measure')
+```
+
+# Wrangle outputs
+```{r}
+model_metric_table= rbind(outputs_cat1 %>% mutate(outcome = 'Suicidal Events', type = 'glmer'),
+                          outputs_thought %>% mutate(outcome = 'Suicidal Ideation', type = 'glmer'))
+
+model_metric_table = model_metric_table %>%
+  dplyr::select(outcome, dataset=time, model_name, everything(), -ppv) %>%
+  dplyr::arrange(outcome, dataset, model_name)
+
+
+model_metric_table %>%
+  dplyr::filter(dataset == 'test', model_name != 'Intercepts Only') %>%
+  dplyr::select(-dataset, -type) %>%
+  mutate(auc = paste0(format(round(auc, 2), nsmall=2), ', [', 
+                      format(round(auc.lwr, 2),nsmall=2), ', ', 
+                      format(round(auc.upr, 2), nsmall=2), ']'),
+         sensitivity = format(round(sensitivity,2), nsmall=2),
+         specificity=format(round(specificity, 2), nmsall=2))  %>%
+  dplyr::select(-auc.upr, -auc.lwr) %>%
+  write.csv('model_outputs/weekly_prediction_model_results.csv', row.names = FALSE)
+
+model_metric_table %>%
+  dplyr::filter(dataset == 'test') %>%
+  ggplot(data = ., aes(x = model_name, y = auc)) +
+  geom_point() + 
+  facet_grid(~outcome) +
+  geom_hline(yintercept = 0.5) +
+  theme_bw()
+
+h = df_for_validation %>%
+  group_by(ID) %>%
+  summarise(sum_events = sum(event_cat1_lead1week))
+
+
+sum(df_for_validation$event_cat1_lead1week)/nrow(df_for_validation)
+sum(df_for_validation$ema_trigger_lead1week)/nrow(df_for_validation)
+
+
+model_metric_table %>%
+  dplyr::filter(dataset=='test') %>%  
+  dplyr::filter(model_name != 'Intercepts Only', model_name != 'Null (AR Only)', type!= 'AR1') %>%
+  ggplot(data=., aes(x = model_name, y = auc, color = type)) +
+  geom_point(position = position_dodge(0.2)) +
+  geom_errorbar(aes(ymin = auc.lwr, ymax = auc.upr), width = 0.2, position = position_dodge(0.2)) + 
+  facet_grid(~outcome) +
+  geom_hline(yintercept = 0.5) +
+  labs(y = 'AUC', title = 'Training on first half of weeks, testing on last half')
+
+
+```
+
+# Combine with outputs from between-participant validation for plotting/tables
+
+```{r}
+load('model_outputs/btw_prediction_results.rda')
+
+model_metric_table = model_metric_table %>%
+  mutate(sig_star = ifelse(auc.lwr > 0.5, '*', ''))
+
+
+within_prediction_plot_all = model_metric_table %>%
+  dplyr::filter(dataset=='test', type == 'glmer') %>%  
+  dplyr::filter(! model_name %in% c('Intercepts Only', 'Baseline SI Only')) %>%
+  dplyr::mutate(outcome = dplyr::recode(outcome, 'Suicidal Behaviors'='Suicide Events', 'Suicidal Ideation'='Suicidal Ideation')) %>%
+  ggplot(data = ., aes(x = model_name, y = auc, color = outcome)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = auc.lwr, ymax = auc.upr), width = 0, lwd = 1) +
+  geom_text(aes(y = auc.upr*1.02, x = model_name, label = sig_star)) +
+  geom_hline(yintercept = 0.5, lty = 2) + 
+  theme_bw() +
+  facet_grid(rows = vars(outcome))+
+  labs(x = NULL, y = 'AUC', title = 'Weekly Prediction') +
+  coord_flip() +
+  theme(axis.text.y = element_blank(), 
+        plot.title = element_text(hjust = 0.5),
+        legend.position = 'none', 
+        text = element_text(face = 'bold')) +
+  scale_color_viridis_d(end = 0.7) +
+  scale_x_discrete(limits = rev(c('Baseline Features', 'Homestay', 'Geolocation', 'Baseline Features + Homestay', 'Baseline + Geolocation Features')))
+
+within_prediction_plot_all_si = model_metric_table %>%
+  dplyr::filter(dataset=='test', type == 'glmer') %>%  
+  dplyr::filter(! model_name %in% c('Intercepts Only')) %>%
+  dplyr::mutate(outcome = dplyr::recode(outcome, 'Suicidal Behaviors'='Suicide Events', 'Suicidal Ideation'='Suicidal Ideation')) %>%
+  ggplot(data = ., aes(x = model_name, y = auc, color = outcome)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = auc.lwr, ymax = auc.upr), width = 0, lwd = 1) +
+  geom_text(aes(y = auc.upr*1.02, x = model_name, label = sig_star)) +
+  geom_hline(yintercept = 0.5, lty = 2) + 
+  theme_bw() +
+  facet_grid(rows = vars(outcome))+
+  labs(x = NULL, y = 'AUC', title = 'Weekly Prediction') +
+  coord_flip() +
+  theme(axis.text.y = element_blank(), 
+        plot.title = element_text(hjust = 0.5),
+        legend.position = 'none', 
+        text = element_text(face = 'bold')) +
+  scale_color_viridis_d(end = 0.7) +
+  scale_x_discrete(limits = rev(c('Baseline Features', 'Homestay', 'Geolocation', 'Baseline Features + Homestay', 'Baseline + Geolocation Features', 'Baseline SI Only')))
+
+
+btw_prediction_plot_all = model_outs %>%
+  pivot_longer(cols = contains('auc')) %>%
+  dplyr::filter(!is.na(value), name!='auc_null', name != 'auc_event', name != 'auc_si') %>%
+  mutate(name = dplyr::recode(name, 'auc_base'='Baseline Features', 'auc_all'='Baseline + Geolocation Features', 'auc_geo'='Geolocation Features', 'auc_homestay'='Homestay', 'auc_homestay_base'='Baseline Features + Homestay')) %>%
+  dplyr::filter(!name %in% c('Intercepts Only')) %>%
+  group_by(name, type) %>%
+  summarise(auc_mean = mean(value),
+         lower_auc = quantile(value, probs = 0.025),
+         upper_auc = quantile(value, probs = 0.975)) %>%
+  mutate(sig_star = ifelse(lower_auc > 0.5, '*', '')) %>%
+  ggplot(data = ., aes(x = name, y = auc_mean, color = type)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower_auc, ymax = upper_auc), width = 0, lwd = 1) +
+  geom_hline(yintercept = 0.5, lty = 2) + 
+  theme_bw() +
+  facet_grid(rows = vars(type))+
+  labs(x = 'Model', y = 'AUC', title = 'Between-Person Prediction') +
+  coord_flip() +
+  scale_x_discrete(limits = rev(c('Baseline Features', 'Homestay', 'Geolocation Features', 'Baseline Features + Homestay', 'Baseline + Geolocation Features'))) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        legend.position = 'none',
+        text = element_text(face = 'bold')) +
+  scale_color_viridis_d(end = 0.7)
+
+btw_prediction_plot_all_si = model_outs %>%
+  pivot_longer(cols = contains('auc')) %>%
+  dplyr::filter(!is.na(value), name!='auc_null', name != 'auc_event') %>%
+  mutate(name = dplyr::recode(name, 'auc_base'='Baseline Features', 'auc_all'='Baseline + Geolocation Features', 'auc_geo'='Geolocation Features', 'auc_homestay'='Homestay', 'auc_homestay_base'='Baseline Features + Homestay', 'auc_si'='Baseline SI Only')) %>%
+  dplyr::filter(!name %in% c('Intercepts Only')) %>%
+  group_by(name, type) %>%
+  summarise(auc_mean = mean(value),
+         lower_auc = quantile(value, probs = 0.025),
+         upper_auc = quantile(value, probs = 0.975)) %>%
+  mutate(sig_star = ifelse(lower_auc > 0.5, '*', '')) %>%
+  ggplot(data = ., aes(x = name, y = auc_mean, color = type)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower_auc, ymax = upper_auc), width = 0, lwd = 1) +
+  geom_hline(yintercept = 0.5, lty = 2) + 
+  theme_bw() +
+  facet_grid(rows = vars(type))+
+  labs(x = 'Model', y = 'AUC', title = 'Between-Person Prediction') +
+  coord_flip() +
+  scale_x_discrete(limits = rev(c('Baseline Features', 'Homestay', 'Geolocation Features', 'Baseline Features + Homestay', 'Baseline + Geolocation Features', 'Baseline SI Only'))) +
+  theme(strip.background = element_blank(),
+        strip.text.y = element_blank(),
+        plot.title = element_text(hjust = 0.5),
+        legend.position = 'none',
+        text = element_text(face = 'bold')) +
+  scale_color_viridis_d(end = 0.7)
+
+
+prediction_results_grid_all_si = cowplot::plot_grid(btw_prediction_plot_all_si+ 
+                                               labs(title = 'Between-Person Prediction'),
+                                             within_prediction_plot_all_si,
+                                             labels = c('A', 'B'), rel_widths = c(1.4, 1))
+
+
+
+prediction_results_grid_all= cowplot::plot_grid(btw_prediction_plot_all + 
+                                               labs(title = 'Between-Person Prediction'),
+                                             within_prediction_plot_all,
+                                             labels = c('A', 'B'), rel_widths = c(1.4, 1))
+
+cowplot::save_plot(prediction_results_grid_all_si, file = 'plots/supplement/fig3_prediction_model_plot_all_plus_si.png', base_height = 4, base_width = 9)
+cowplot::save_plot(prediction_results_grid_all, file = 'plots/fig3_prediction_model_plot_all.png', base_height = 4.5, base_width = 9)
+
+```
+
+
+```{r}
+btw_prediction_table= model_outs %>%
+  pivot_longer(cols = contains('auc')) %>%
+  dplyr::filter(!is.na(value), name!='auc_null', name != 'auc_event') %>%
+  mutate(name = dplyr::recode(name, 'auc_base'='Baseline Features', 'auc_all'='Baseline + Geolocation Features', 'auc_geo'='Geolocation Features', 'auc_homestay'='Homestay', 'auc_homestay_base'='Baseline Features + Homestay')) %>%
+  dplyr::filter(!name %in% c('Intercepts Only')) %>%
+  group_by(name, type) %>%
+  summarise(auc_mean = mean(value),
+         lower_auc = quantile(value, probs = 0.025),
+         upper_auc = quantile(value, probs = 0.975))
+```
+
+
+
+```{r}
+model_outs = model_outs %>% mutate(difference_geo_base = auc_geo - auc_base)
+
+
+model_outs %>%
+  dplyr::filter(!is.na(auc_geo)) %>%
+  group_by(type) %>%
+  summarise(prop_better = sum(difference_geo_base >0)/n())
+```
+

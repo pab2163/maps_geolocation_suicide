@@ -1,0 +1,252 @@
+---
+title: "Prediction/Validation Between Participants"
+author: "Ranqing Lan, Paul Bloom Updated 2024-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(lme4)
+library(Matrix)
+library(lmerTest)
+library(brms)
+library(rstan)
+library(emmeans)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(crosstalk)
+library(shiny)
+library(DT)
+library(readxl,quietly=TRUE,warn.conflicts=FALSE)
+library(lubridate,quietly=TRUE,warn.conflicts=FALSE )
+library(zoo)
+library(psych)
+library(openxlsx)
+library(sjmisc)
+library(sjlabelled)
+library(sjPlot)
+library(gridExtra)
+library(grid)
+library(ggplot2)
+library(caret)
+library(pROC)
+require(compiler)
+require(parallel)
+require(boot)
+require(lattice)
+rm(list=ls())
+
+# Train models for 10000 iterations
+n_iter = 10000
+```
+
+# Pull in data
+
+```{r, include = FALSE}
+data_agg <- read_csv("/Volumes/columbia/MAPS_Data/Ranqing/MAPS_suicidal_behavior/scripts_rev1/cleaned_data/weekly_data_with_stb.csv", show_col_types = FALSE)
+
+## standardize geolocation features
+df = data_agg
+
+# join in self-report data
+load('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/Self_Report/data/self_report_02_07_2024.Rda')
+selfreport_v8 = mutate(selfreport_v8, SSI19_baseline_imp1month = coalesce(SSI19_i, SSI19_1))
+df = left_join(df, selfreport_v8, by = 'ID')
+```
+
+# Data splitting & scaling
+
+```{r}
+baseclinical <- c("SSI19_baseline_imp1month")
+geomatrix <- c('travel_km_dev', 'home_min_dev' , 'entropy_dev', 'entropy_mean', 'home_min_mean', 'travel_km_mean')
+demo <- c("sex" , "age" ,"SITE", "iPhone") 
+time <- "week_num"
+
+
+df_for_validation = dplyr::select(df, ID, week_num, event_cat1,ema_trigger,
+                   all_of(baseclinical), all_of(geomatrix), all_of(demo), all_of(time))
+
+```
+
+# Split out data from first month of study versus rest of study period (1/6th of study period) for train/test
+
+```{r}
+week_prop = 1/6
+
+df_for_validation_summary = df_for_validation %>%
+  group_by(ID, across(all_of(baseclinical)), across(all_of(demo))) %>%
+  summarise(week_num_cutoff = quantile(week_num, week_prop), 
+    mean_entropy_first = mean(entropy_mean[week_num < week_num_cutoff], na.rm = TRUE),
+    mean_home_min_first = mean(home_min_mean[week_num < week_num_cutoff], na.rm = TRUE),
+    mean_travel_km_first = mean(travel_km_mean[week_num < week_num_cutoff], na.rm = TRUE),
+    suicidal_event_first = max(event_cat1[week_num < week_num_cutoff], na.rm = TRUE),
+    suicidal_event_last = max(event_cat1[week_num >= week_num_cutoff], na.rm = TRUE),
+    ema_trigger_first = max(ema_trigger[week_num < week_num_cutoff], na.rm = TRUE),
+    ema_trigger_last = max(ema_trigger[week_num >= week_num_cutoff], na.rm = TRUE))
+
+
+df_for_validation_summary =df_for_validation_summary %>%
+  dplyr::filter(!is.infinite(suicidal_event_first)) %>%
+  dplyr::mutate(ema_trigger_first = ifelse(is.infinite(ema_trigger_first), 0, ema_trigger_first),
+                ema_trigger_last = ifelse(is.infinite(ema_trigger_last), 0, ema_trigger_last))
+
+table(df_for_validation_summary$suicidal_event_last)
+table(df_for_validation_summary$ema_trigger_last)
+
+```
+
+# Function for training/testing suicide event models
+
+```{r}
+train_test_model_event = function(iter, seed){
+  set.seed(seed)
+  train_index = caret::createDataPartition(df_for_validation_summary$suicidal_event_last, p = 0.7, times = 1, list = FALSE)
+  train_data = df_for_validation_summary[train_index, ]
+  test_data = df_for_validation_summary[-train_index, ]
+  
+  scaler = caret::preProcess(train_data %>% dplyr::select(mean_entropy_first, mean_home_min_first, mean_travel_km_first), method = c("scale"))
+  train_data = predict(scaler, train_data)
+  test_data = predict(scaler, test_data)
+  
+  geo_model = glm(data = train_data, suicidal_event_last ~ mean_entropy_first + mean_home_min_first + mean_travel_km_first, 
+               family = binomial(link = 'logit'))
+  
+  homestay_model = glm(data = train_data, suicidal_event_last ~  mean_home_min_first, 
+               family = binomial(link = 'logit'))
+  
+  homestay_base_model = glm(data = train_data, suicidal_event_last ~  mean_home_min_first + SSI19_baseline_imp1month + sex + age + SITE + iPhone, 
+               family = binomial(link = 'logit'))
+  
+  base_model = glm(data = train_data, suicidal_event_last ~ SSI19_baseline_imp1month + sex + SITE + age + iPhone,
+                   family = binomial(link = 'logit'))
+  
+  si_model = glm(data = train_data, suicidal_event_last ~ SSI19_baseline_imp1month,
+                   family = binomial(link = 'logit'))
+  
+  all_model = glm(data = train_data, suicidal_event_last ~ sex + age + SITE + iPhone + SSI19_baseline_imp1month +
+                    mean_entropy_first + mean_home_min_first + mean_travel_km_first,
+                   family = binomial(link = 'logit'))
+  
+  geo_preds = predict(geo_model, test_data, type = 'response')
+  base_preds = predict(base_model, test_data, type = 'response')
+  si_preds = predict(si_model, test_data, type = 'response')
+  all_preds = predict(all_model, test_data, type = 'response')
+  homestay_preds = predict(homestay_model, test_data, type = 'response')
+  homestay_base_preds = predict(homestay_base_model, test_data, type = 'response')
+
+
+  auc_geo = pROC::auc(test_data$suicidal_event_last, geo_preds)
+  auc_base = pROC::auc(test_data$suicidal_event_last, base_preds)
+  auc_si = pROC::auc(test_data$suicidal_event_last, si_preds)
+  auc_all = pROC::auc(test_data$suicidal_event_last, all_preds)
+  auc_homestay = pROC::auc(test_data$suicidal_event_last, homestay_preds)
+  auc_homestay_base = pROC::auc(test_data$suicidal_event_last, homestay_base_preds)
+
+  
+  df_out = data.frame(iter=iter, seed=seed, auc_geo, auc_base, auc_si, auc_all, auc_homestay, auc_homestay_base)
+  return(df_out)
+  
+}
+```
+
+# Function for training/testing ema trigger model
+
+```{r}
+train_test_model_thoughts = function(iter, seed){
+  set.seed(seed)
+  train_index = caret::createDataPartition(df_for_validation_summary$ema_trigger_last, p = 0.7, times = 1, list = FALSE)
+  train_data = df_for_validation_summary[train_index, ]
+  test_data = df_for_validation_summary[-train_index, ]
+  
+  train_data = dplyr::filter(train_data, !is.infinite(ema_trigger_last), !is.infinite(ema_trigger_first),
+                             !is.na(ema_trigger_last), !is.na(ema_trigger_first))
+  
+  scaler = caret::preProcess(train_data %>% dplyr::select(mean_entropy_first, mean_home_min_first, mean_travel_km_first), method = c("scale"))
+  train_data = predict(scaler, train_data)
+  test_data = predict(scaler, test_data)
+  
+  geo_model = glm(data = train_data, ema_trigger_last ~ mean_entropy_first + mean_home_min_first + mean_travel_km_first, 
+               family = binomial(link = 'logit'))
+
+  base_model = glm(data = train_data, ema_trigger_last ~ SSI19_baseline_imp1month + sex + age + SITE + iPhone,
+                   family = binomial(link = 'logit'))
+  
+  si_model = glm(data = train_data, ema_trigger_last ~ SSI19_baseline_imp1month,
+                   family = binomial(link = 'logit'))
+  
+  homestay_model = glm(data = train_data, ema_trigger_last ~  mean_home_min_first, 
+               family = binomial(link = 'logit'))
+  
+  homestay_base_model = glm(data = train_data, ema_trigger_last ~  mean_home_min_first + SSI19_baseline_imp1month + sex + age + SITE + iPhone, 
+               family = binomial(link = 'logit'))
+  
+  all_model = glm(data = train_data, ema_trigger_last ~ sex + age + SITE + iPhone + SSI19_baseline_imp1month +
+                    mean_entropy_first + mean_home_min_first + mean_travel_km_first,
+                   family = binomial(link = 'logit'))
+  
+  geo_preds = predict(geo_model, test_data, type = 'response')
+  base_preds = predict(base_model, test_data, type = 'response')
+  si_preds = predict(si_model, test_data, type = 'response')
+
+  all_preds = predict(all_model, test_data, type = 'response')
+  homestay_preds = predict(homestay_model, test_data, type = 'response')
+  homestay_base_preds = predict(homestay_base_model, test_data, type = 'response')
+
+  
+  auc_geo = pROC::auc(test_data$ema_trigger_last, geo_preds)
+  auc_base = pROC::auc(test_data$ema_trigger_last, base_preds)
+  auc_si = pROC::auc(test_data$suicidal_event_last, si_preds)
+  auc_all = pROC::auc(test_data$ema_trigger_last, all_preds)
+  auc_homestay = pROC::auc(test_data$ema_trigger_last, homestay_preds)
+  auc_homestay_base = pROC::auc(test_data$ema_trigger_last, homestay_base_preds)
+
+  
+  df_out = data.frame(iter=iter, seed=seed, auc_geo, auc_base, auc_si, auc_all, auc_homestay, auc_homestay_base)
+  return(df_out)
+  
+}
+
+```
+
+# Train/Test Event Models
+```{r suicide_event_models}
+for (i in 1:n_iter){
+  ot = try(train_test_model_event(iter=i, seed = i))
+  if (i==1){
+    outframe_events = ot
+  }else{
+    outframe_events = rbind(outframe_events, ot)
+  }
+}
+
+outframe_events = outframe_events %>% mutate_all(.funs = as.numeric)
+```
+
+# Train/test thoughts models
+
+```{r, ema_trigger_models}
+for (i in 1:n_iter){
+  ot_thought = try(train_test_model_thoughts(iter=i, seed = i))
+  if (i==1){
+    outframe_thoughts = ot_thought
+  }else{
+    outframe_thoughts = rbind(outframe_thoughts, ot_thought)
+  }
+}
+
+outframe_thoughts = outframe_thoughts %>% mutate_all(.funs = as.numeric)
+```
+
+# Save outputs
+
+```{r}
+model_outs = rbind(outframe_events %>% mutate(type = 'Events'), outframe_thoughts %>% mutate(type = 'EMA Trigger')) 
+
+save(model_outs, file = 'model_outputs/btw_prediction_results.rda')
+```
+
+
+
+
+

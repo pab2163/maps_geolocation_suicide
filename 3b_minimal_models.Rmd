@@ -1,0 +1,171 @@
+---
+title: "Data Vis & Models"
+author: "Ranqing Lan - updated Paul Bloom"
+date: "Created 2023-04-21, updated 2024-11-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(lme4)
+library(Matrix)
+library(lmerTest)
+library(brms)
+library(rstan)
+library(emmeans)
+library(tidyverse)
+library(readxl,quietly=TRUE,warn.conflicts=FALSE)
+library(lubridate,quietly=TRUE,warn.conflicts=FALSE )
+library(zoo)
+library(psych)
+library(openxlsx)
+library(corrplot)
+library(sjPlot)
+library(ggplot2)
+options(scipen = 999)
+library(purrr)
+library(broom)
+library(broom.mixed)
+```
+
+## Explanatory Analyses {.tabset}
+
+### Setup
+
+```{r, include = FALSE}
+df <- read_csv('cleaned_data/weekly_data_with_stb.csv')
+
+b= df %>%
+  group_by(ID, home_min_idmean, travel_km_idmean, entropy_idmean) %>%
+  count()
+  
+## Standardize geolocation features
+df <- df %>%
+  group_by(ID) %>%
+  mutate(
+    entropy_dev = scale(entropy_dev, center = FALSE, scale = TRUE),
+    home_h_dev = scale(home_h_dev, center = FALSE, scale = TRUE),
+    travel_km_dev = scale(travel_km_dev, center = FALSE, scale = TRUE),
+    entropy_dev_lead1week = scale(entropy_dev_lead1week, center = FALSE, scale = TRUE),
+    home_h_dev_lead1week = scale(home_h_dev_lead1week, center = FALSE, scale = TRUE),
+    travel_km_dev_lead1week = scale(travel_km_dev_lead1week, center = FALSE, scale = TRUE)) %>%
+  ungroup()
+
+# Bring in data for exclusions based on home distance
+homedist = read.csv('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/home_location/maps_home_distances_from_nyc_pitt.csv')
+df = left_join(df, dplyr::select(homedist, ID=subject_id, min_study_site_distance), by = 'ID')
+df = mutate(df, homedist_exclude = min_study_site_distance > 100)
+
+# join in self-report data
+load('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/Self_Report/data/self_report_02_07_2024.Rda')
+selfreport_v8 = mutate(selfreport_v8, SSI19_baseline_imp1month = coalesce(SSI19_i, SSI19_1),
+                       SSI19_baseline_imp1month = scale(SSI19_baseline_imp1month),
+                       Control = ifelse(GROUP == 'Control',1, 0))
+df = left_join(df, selfreport_v8, by = 'ID')
+
+# remove weeks with fewer than 3 days with GPS
+sum(df$gps_missing3)
+
+# scale btw-person variables
+df = mutate(df,
+            entropy_idmean = scale(round(entropy_idmean, 3)),
+            travel_km_idmean = scale(round(travel_km_idmean, 3)),
+            home_h_idmean = scale(round(home_min_idmean/60, 3)))
+
+length(unique(df$ID))
+sum(df$ema_trigger, na.rm = TRUE)
+sum(df$event_cat1)
+```
+
+#### Checks for data availability 
+```{r}
+b = df %>%
+  group_by(ID) %>%
+  summarise(n_obs_home = sum(!is.na(home_h_dev)),
+            n_obs_travel= sum(!is.na(travel_km_dev)),
+            n_obs_entropy = sum(!is.na(entropy_dev)),
+            ssi_i = sum(!is.na(SSI19_i)),
+            ssi_1 = sum(!is.na(SSI19_1)),
+            ssi_best = sum(!is.na(SSI19_baseline_imp1month)))
+
+c = df %>%
+  dplyr::filter(is.na(SSI19_i))
+
+e = selfreport_v8 %>%
+  dplyr::filter(is.na(SSI19_i)) %>%
+  dplyr::select(ID, SITE, GROUP, contains('SSI'), contains('MFQ'))
+```
+
+### Within-Person Analyses 
+
+
+#### EMA Triggers (Ideation)
+
+```{r}
+fit_ema_homestay_concurrent = glmer(ema_trigger  ~  home_h_dev +  home_h_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_ema_entropy_concurrent = glmer(ema_trigger  ~  entropy_dev +  entropy_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_ema_travelkm_concurrent = glmer(ema_trigger  ~  travel_km_dev +  travel_km_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+
+fit_ema_homestay_lead1week = glmer(ema_trigger_lead1week  ~  home_h_dev +  home_h_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_ema_entropy_lead1week  = glmer(ema_trigger_lead1week  ~  entropy_dev +  entropy_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_ema_travelkm_lead1week  = glmer(ema_trigger_lead1week  ~  travel_km_dev +  travel_km_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+
+
+tab_model(fit_ema_entropy_concurrent, fit_ema_homestay_concurrent, fit_ema_travelkm_concurrent)
+tab_model(fit_ema_entropy_lead1week, fit_ema_homestay_lead1week, fit_ema_travelkm_lead1week)
+
+```
+
+#### Suicide Events  
+
+```{r}
+fit_event_homestay_concurrent = glmer(event_cat1  ~  home_h_dev +  home_h_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_event_entropy_concurrent = glmer(event_cat1  ~  entropy_dev +  entropy_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_event_travelkm_concurrent = glmer(event_cat1  ~  travel_km_dev +  travel_km_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+
+fit_event_homestay_lead1week = glmer(event_cat1_lead1week  ~  home_h_dev +  home_h_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_event_entropy_lead1week  = glmer(event_cat1_lead1week  ~  entropy_dev +  entropy_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_event_travelkm_lead1week  = glmer(event_cat1_lead1week  ~  travel_km_dev +  travel_km_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+
+
+tab_model(fit_event_entropy_concurrent, fit_event_homestay_concurrent, fit_event_travelkm_concurrent)
+tab_model(fit_event_entropy_lead1week, fit_event_homestay_lead1week, fit_event_travelkm_lead1week)
+
+
+```

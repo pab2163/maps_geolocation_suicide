@@ -1,0 +1,735 @@
+---
+title: "Data Vis & Models"
+author: "Ranqing Lan - updated Paul Bloom"
+date: "Created 2023-04-21, updated 2024-11-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(lme4)
+library(Matrix)
+library(lmerTest)
+library(brms)
+library(rstan)
+library(emmeans)
+library(tidyverse)
+library(readxl,quietly=TRUE,warn.conflicts=FALSE)
+library(lubridate,quietly=TRUE,warn.conflicts=FALSE )
+library(zoo)
+library(psych)
+library(openxlsx)
+library(corrplot)
+library(sjPlot)
+library(ggplot2)
+options(scipen = 999)
+library(purrr)
+library(broom)
+library(broom.mixed)
+
+# function for getting odds ratios dataframe from brms logistic regression
+get_or_brms = function(model){
+  out_df = fixef(model) %>%
+    exp() %>%
+    as.data.frame() %>%
+    mutate(term = row.names(.))
+  return(out_df)
+}
+```
+
+## Explanatory Analyses {.tabset}
+
+### Setup
+
+```{r, include = FALSE}
+df <- read_csv('cleaned_data/weekly_data_with_stb_multihome.csv')
+
+b= df %>%
+  group_by(ID, home_min_idmean, travel_km_idmean, entropy_idmean) %>%
+  count()
+  
+## Standardize geolocation features
+df <- df %>%
+  group_by(ID) %>%
+  mutate(
+    entropy_dev = scale(entropy_dev, center = FALSE, scale = TRUE),
+    home_h_dev = scale(home_h_dev, center = FALSE, scale = TRUE),
+    travel_km_dev = scale(travel_km_dev, center = FALSE, scale = TRUE),
+    entropy_dev_lead1week = scale(entropy_dev_lead1week, center = FALSE, scale = TRUE),
+    home_h_dev_lead1week = scale(home_h_dev_lead1week, center = FALSE, scale = TRUE),
+    travel_km_dev_lead1week = scale(travel_km_dev_lead1week, center = FALSE, scale = TRUE)) %>%
+  ungroup()
+
+# Bring in data for exclusions based on home distance
+homedist = read.csv('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/home_location/maps_home_distances_from_nyc_pitt.csv')
+df = left_join(df, dplyr::select(homedist, ID=subject_id, min_study_site_distance), by = 'ID')
+df = mutate(df, homedist_exclude = min_study_site_distance > 100)
+
+# join in self-report data
+load('/Volumes/columbia/MAPS_Data/Analysis/Wrangling/Self_Report/data/self_report_02_07_2024.Rda')
+selfreport_v8 = mutate(selfreport_v8, SSI19_baseline_imp1month = coalesce(SSI19_i, SSI19_1),
+                       SSI19_baseline_imp1month = scale(SSI19_baseline_imp1month),
+                       Control = ifelse(GROUP == 'Control',1, 0))
+df = left_join(df, selfreport_v8, by = 'ID')
+
+# remove weeks with fewer than 3 days with GPS
+sum(df$gps_missing3)
+
+# scale btw-person variables
+df = mutate(df,
+            entropy_idmean = scale(round(entropy_idmean, 3)),
+            travel_km_idmean = scale(round(travel_km_idmean, 3)),
+            home_h_idmean = scale(round(home_min_idmean/60, 3)))
+
+length(unique(df$ID))
+sum(df$ema_trigger, na.rm = TRUE)
+sum(df$event_cat1)
+```
+
+#### Checks for data availability 
+```{r}
+b = df %>%
+  group_by(ID) %>%
+  summarise(n_obs_home = sum(!is.na(home_h_dev)),
+            n_obs_travel= sum(!is.na(travel_km_dev)),
+            n_obs_entropy = sum(!is.na(entropy_dev)),
+            ssi_i = sum(!is.na(SSI19_i)),
+            ssi_1 = sum(!is.na(SSI19_1)),
+            ssi_best = sum(!is.na(SSI19_baseline_imp1month)))
+
+c = df %>%
+  dplyr::filter(is.na(SSI19_i))
+
+e = selfreport_v8 %>%
+  dplyr::filter(is.na(SSI19_i)) %>%
+  dplyr::select(ID, SITE, GROUP, contains('SSI'), contains('MFQ'))
+```
+
+### EMA Triggers (Ideation)
+
+```{r}
+fit_ema_concurrent_frequentist = glmer(ema_trigger  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_ema_concurrent = brm(ema_trigger  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num + (1|ID), data = df,
+              family = bernoulli(link='logit'), iter = 2000, cores = 4, seed = 11291993)
+
+fit_ema_lead1week = glmer(ema_trigger_lead1week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                            week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_ema_lead2week = glmer(ema_trigger_lead2week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                            week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_ema_lead3week = glmer(ema_trigger_lead3week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                            week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+
+# Models asking whether triggers are associated with changes in geolocation variables the following week 
+fit_homestay_lead1_week = lmer(home_h_dev_lead1week  ~ ema_trigger + schoolclosure + week_num + (1|ID) , data = df)
+
+fit_entropy_lead1_week = lmer(entropy_dev_lead1week  ~ ema_trigger + schoolclosure + week_num + (1|ID) , data = df)
+
+fit_travel_km_lead1_week = lmer(travel_km_dev_lead1week  ~ ema_trigger + schoolclosure + week_num + (1|ID) , data = df)
+
+
+tab_model(fit_homestay_lead1_week, fit_entropy_lead1_week, fit_travel_km_lead1_week)
+```
+
+#### Tables of stats
+
+```{r}
+sjPlot::tab_model(fit_ema_concurrent_frequentist, fit_ema_lead1week)
+
+summary(fit_ema_concurrent_frequentist)
+```
+
+#### Plots odds ratios
+```{r}
+df_or_ema_within <- broom::tidy(fit_ema_lead1week, conf.int=TRUE, conf.level = 0.95, exponentiate=TRUE)  %>%
+  filter(term %in% c("home_h_dev", "entropy_dev", "travel_km_dev")) %>%
+  dplyr:: select(term, estimate, std.error, p.value, conf.low, conf.high) %>% 
+  mutate(., sig = ifelse((conf.low > 1 & conf.high > 1) |
+                                            (conf.low < 1 & conf.high < 1), '*', ''))
+
+
+colors = c( "lightblue", "red","black")
+or_ema_within_plot <- df_or_ema_within %>%
+    mutate(term = dplyr::recode(term, 'home_h_dev' ='Home Stay', 'entropy_dev'='Entropy', "travel_km_dev" = "Distance Traveled")) %>%
+    ggplot(data=., aes(x = term, y = estimate)) +
+    geom_point(position = position_dodge(0.6), aes(color = term)) +
+      geom_errorbar(aes(ymin = conf.low, ymax = conf.high, color = term),
+                    lwd = 1, width = 0, position = position_dodge(0.6)) +
+      labs(x = NULL, y = "Adjusted Odds Ratio", color ="black", title = 'Within-Person Suicidal Ideation Models') +
+      geom_hline(yintercept = 1, lty = 2) +
+      geom_text(aes(label = sig, y = conf.high*1.1), size = 5) +
+      labs(color = NULL) +theme_bw()  +
+      scale_color_manual(values = colors) +
+      theme(strip.text.y = element_blank(),
+            axis.text.x = element_text(colour = "black"),
+          axis.text.y = element_text(colour = "black"),
+          legend.position = 'none')  +
+      scale_y_continuous(limits = c(0.25,4.2), breaks=seq(0.25,4,0.75)) +
+      coord_flip()
+
+or_ema_within_plot
+```
+
+### Suicide Events  
+
+```{r}
+fit_event_concurrent = brm(event_cat1  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num + (1|ID), data = df,
+              family = bernoulli(link='logit'), iter = 2000, cores = 4, seed = 11291993)
+
+fit_event_concurrent_frequentist = glmer(event_cat1  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num + (1|ID), data = df,
+              family = binomial(link='logit'), control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+df$month = format(df$week_start_wednesday, "%m")
+df = mutate(df, summerbreak = ifelse(month %in% c('07', '09'), 1, 0))
+
+fit_event_lead1week = brm(event_cat1_lead1week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = bernoulli(link='logit'), iter = 2000, cores = 4, seed = 11291993)
+
+fit_event_lead1week_frequentist = glmer(event_cat1_lead1week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = binomial(link='logit'), control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_event_lead2week = brm(event_cat1_lead2week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = bernoulli(link='logit'), iter = 2000, cores = 4, seed = 11291993)
+
+fit_event_lead3week = brm(event_cat1_lead3week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num + (1|ID) , data = df,
+              family = bernoulli(link='logit'), iter = 2000, cores = 4, seed = 11291993)
+
+fit_event_lead1week_homestay_only = brm(event_cat1_lead1week  ~  home_h_dev + home_h_idmean + week_num + (1|ID) , data = df,
+                                        family = bernoulli(link='logit'), iter = 2000, cores = 4, seed = 11291993)
+
+# Sensitivity check excluding participants with home distance over 100 miles from a study site
+fit_event_concurrent_homedist_exclude = brm(event_cat1  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num + (1|ID),
+                data = df %>% dplyr::filter(., homedist_exclude == 0),
+              family = bernoulli(link='logit'), iter = 2000, cores = 4, seed = 11291993)
+
+fit_event_lead1week_homedist_exclude = brm(event_cat1_lead1week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean + 
+                             week_num + (1|ID), 
+                             data = df %>% dplyr::filter(., homedist_exclude == 0),
+              family = bernoulli(link='logit'), iter = 2000, cores = 4, seed = 11291993)
+```
+
+
+#### Results table: concurrent GPS & suicide events
+
+
+```{r}
+sjPlot::tab_model(fit_event_concurrent, fit_event_concurrent_homedist_exclude)
+```
+
+#### Results table: GPS & next-week suicide events
+
+
+```{r}
+sjPlot::tab_model(fit_event_lead1week, fit_event_lead1week_homedist_exclude)
+```
+
+#### Lead 1 week table for paper
+
+```{r}
+event_model_table = broom::tidy(fit_event_lead1week_frequentist, exponentiate=TRUE, conf.int=TRUE) %>%
+  dplyr::select(term, aOR=estimate, conf.low, conf.high, p.value) %>%
+  dplyr::filter(term!= 'sd__(Intercept)') %>%
+  mutate(aOR = round(aOR, 2), 
+         `95% CI`=paste0(round(conf.low,2), ', ', round(conf.high, 2)),
+         p.value = round(p.value, 3)) %>%
+  dplyr::select(term, aOR, `95% CI`, p.value) %>%
+  mutate(outcome = 'Suicide Events')
+
+event_model_table_betas = broom::tidy(fit_event_lead1week_frequentist) %>%
+  dplyr::select(term, beta=estimate, std.error) %>%
+  dplyr::filter(term!= 'sd__(Intercept)') %>%
+  mutate(beta = round(beta, 2), 
+         std.error = round(std.error, 3)) %>%
+  mutate(outcome = 'Suicide Events')
+
+ema_trigger_table_betas = broom::tidy(fit_ema_lead1week) %>%
+  dplyr::select(term, beta=estimate, std.error) %>%
+  dplyr::filter(term!= 'sd__(Intercept)') %>%
+  mutate(beta = round(beta, 2), 
+         std.error = round(std.error, 3)) %>%
+  mutate(outcome = 'EMA Trigger')
+
+ema_trigger_model_table = broom::tidy(fit_ema_lead1week, exponentiate=TRUE, conf.int=TRUE) %>%
+  dplyr::select(term, aOR=estimate, conf.low, conf.high, p.value) %>%
+  dplyr::filter(term!= 'sd__(Intercept)') %>%
+  mutate(aOR = round(aOR, 2), 
+         `95% CI`=paste0(round(conf.low,2), ', ', round(conf.high, 2)),
+         p.value = round(p.value, 3)) %>%
+  dplyr::select(term, aOR, `95% CI`, p.value) %>%
+  mutate(outcome = 'EMA Trigger')
+
+
+within_participant_model_table_beta= rbind(event_model_table_betas, ema_trigger_table_betas)
+within_participant_model_table = rbind(event_model_table, ema_trigger_model_table)
+
+within_participant_model_table = left_join(within_participant_model_table_beta,
+                                           within_participant_model_table,
+                                           by = c('term', 'outcome')) %>%
+  dplyr::select(., outcome, term, beta, std.error, aOR, `95% CI`, p.value)
+
+write.csv(within_participant_model_table, file = 'tables/within_participant_explanatory_model_table_multihome.csv', 
+          row.names = FALSE)
+```
+
+#### OR Plot for events
+```{r}
+df_or_cat1_within <- broom::tidy(fit_event_lead1week_frequentist, conf.int=TRUE, conf.level = 0.95, exponentiate=TRUE)  %>%
+  filter(term %in% c("home_h_dev", "entropy_dev", "travel_km_dev")) %>%
+  dplyr:: select(term, estimate, std.error, p.value, conf.low, conf.high) %>% 
+  mutate(., sig = ifelse((conf.low > 1 & conf.high > 1) |
+                                            (conf.low < 1 & conf.high < 1), '*', ''))
+
+colors = c("lightblue", "red","black")
+or_cat1_within_plot <- df_or_cat1_within %>%
+    mutate(term = dplyr::recode(term, 'home_h_dev' ='Home Stay', 'entropy_dev'='Entropy', "travel_km_dev" = "Distance Traveled")) %>%
+    ggplot(data=., aes(x = term, y = estimate)) +
+    geom_point(position = position_dodge(0.6), aes(color = term)) +
+      geom_errorbar(aes(ymin = conf.low, ymax = conf.high, color = term),
+                    lwd = 1, width = 0, position = position_dodge(0.6)) +
+      labs(x = NULL, y = "Adjusted Odds Ratio", title = 'Within-Person Suicidal Event Models') +
+      geom_hline(yintercept = 1, lty = 2) +
+      geom_text(aes(label = sig, y = conf.high*1.1), size = 5) +
+      labs(color = NULL) +theme_bw()  +
+      scale_color_manual(values = colors) +
+      theme(strip.text.y = element_blank(),
+            axis.text.x = element_text(colour = "black"),
+          axis.text.y = element_text(colour = "black"),
+          legend.position = 'none')  +
+      scale_y_continuous(limits = c(0.25,4.2), breaks=seq(0.25,4,0.75)) +
+      coord_flip() 
+
+or_cat1_within_plot
+```
+
+
+```{r}
+prob_df_cat1_within <- fit_event_lead1week_frequentist %>%
+  emmeans::emmeans(specs = 'home_h_dev', type = 'response', at = list(home_h_dev = seq(-2, 2,.1 ))) %>% summary()
+
+prob_plot_cat1_within <- prob_df_cat1_within %>%
+  ggplot(., aes(x = home_h_dev, y = 100 * prob)) + 
+  geom_line( size = 1, color = "black")  +
+  geom_ribbon(aes(ymin = 100 * asymp.LCL, ymax = 100 * asymp.UCL),
+              alpha=0.2,
+              fill = "black") + 
+  labs(x = "Home Stay (Within-participant mean-centered)", 
+       y = "Probability [%] of Suicide Event\nDuring Given Week",
+       title = 'Weekly Homestay & Suicidal Events') +
+  labs(color = "black") +theme_bw()
+
+prob_plot_cat1_within
+```
+### Between-person Analyses
+
+
+```{r}
+btw_summary = df %>%
+  mutate(entropy_idmean = round(entropy_idmean, 2),
+            travel_km_idmean = round(travel_km_idmean, 2),
+            home_h_idmean = round(home_h_idmean, 2)) %>%
+  dplyr::select(ID, contains('idmean'), contains('idmean'), event_cat1, ema_trigger, Control,
+                SITE, age, sex, iPhone, SSI19_baseline_imp1month, GROUP) %>%
+  group_by(ID, entropy_idmean, travel_km_idmean, home_h_idmean, Control, GROUP,
+           SITE, age, sex, iPhone, SSI19_baseline_imp1month) %>%
+  summarise(event_cat1_participant = ifelse(sum(event_cat1)>0, 1, 0),
+            ema_trigger_participant = ifelse(sum(ema_trigger, na.rm=TRUE)>0, 1, 0)) %>%
+  mutate(stb_pos = ifelse(Control == '1', '0', '1')) 
+
+
+participant_info = selfreport_v8 %>% dplyr::filter(ID %in% df$ID) %>%
+  mutate(ssi_significant_baseline = SSI19_i >= 4)
+
+table(participant_info$ssi_significant_baseline)
+table(participant_info$ssi_significant_baseline) / nrow(participant_info)
+
+
+
+sum(is.na(participant_info$SelfReportDate_1)) 
+sum(is.na(participant_info$SelfReportDate_3)) 
+sum(is.na(participant_info$SelfReportDate_6))
+
+1 - (sum(is.na(participant_info$SelfReportDate_1)) / nrow(participant_info))
+1 - (sum(is.na(participant_info$SelfReportDate_3)) / nrow(participant_info))
+1 - (sum(is.na(participant_info$SelfReportDate_6)) / nrow(participant_info))
+
+
+baseline_si_btw_models = btw_summary %>%
+  ungroup() %>%
+  mutate(SSI19_baseline_imp1month_z = scale(SSI19_baseline_imp1month)) %>%
+  pivot_longer(c(entropy_idmean, travel_km_idmean, home_h_idmean)) %>%
+  group_by(name) %>%
+  mutate(value = scale(value)) %>%
+  nest() %>%
+  mutate(m = purrr::map(data, ~lm(data = ., value ~ SSI19_baseline_imp1month_z + SITE + sex + iPhone + age)),
+         coef = purrr::map(m, ~broom::tidy(., conf.int=TRUE))) %>%
+  unnest(coef) %>%
+  dplyr::select(-data, -m) %>%
+  dplyr::filter(term != '(Intercept)') %>%
+  mutate(type = 'Baseline\nSuicidal Ideation')
+
+baseline_group_btw_models = btw_summary %>%
+  pivot_longer(c(entropy_idmean, travel_km_idmean, home_h_idmean)) %>%
+  group_by(name) %>%
+  mutate(value = scale(value)) %>%
+  nest() %>%
+  mutate(m = purrr::map(data, ~lm(data = ., value ~ stb_pos + SITE + sex + iPhone + age)),
+         coef = purrr::map(m, ~broom::tidy(., conf.int=TRUE))) %>%
+  unnest(coef) %>%
+  dplyr::select(-data, -m) %>%
+  dplyr::filter(term != '(Intercept)') %>%
+  mutate(type = 'STB History+ vs. STB History-')
+
+btw_models_summary = rbind(baseline_si_btw_models) %>%
+  dplyr::filter(grepl('_participant', term) | term == 'SSI19_baseline_imp1month_z' | term == 'stb_pos1') %>%
+  mutate(name = dplyr::recode(name, 'home_h_idmean' ='Home Stay', 'entropy_idmean'='Entropy', "travel_km_idmean" = "Distance Traveled"))
+
+colors = c( "lightblue", "red","black")
+
+
+btw_models_summary = mutate(btw_models_summary, sig = ifelse((conf.low > 0 & conf.high > 0) |
+                                                             (conf.low < 0 & conf.high < 0), '*', ''))
+
+between_models_plot = ggplot(btw_models_summary, aes(x = name, y = estimate, color = name)) +
+  geom_point(size = 3) + 
+  geom_text(aes(label = sig, y = conf.high*1.1), size = 5) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0, lwd = 1) +
+  facet_grid(~type) +
+  geom_hline(yintercept = 0, lty = 2) +
+  coord_flip() +
+  theme_bw() +
+  labs(y = 'Beta Estimate', x = NULL, title = '') +
+  scale_color_manual(values = colors, 
+                     limits = c('Distance Traveled', 'Entropy', 'Home Stay')) +
+  theme(legend.position = 'none',
+        axis.text.y = element_blank(),
+        panel.spacing = unit(0, "lines"))
+
+
+concurrent_between= rbind(get_or_brms(fit_ema_concurrent) %>% mutate(type = 'Suicidal Ideation\nESM'),
+                          get_or_brms(fit_event_concurrent) %>% mutate(type = 'Suicidal Events')) %>%
+  mutate(., sig = ifelse((Q2.5 > 1 & Q97.5 > 1) |
+                                                             (Q2.5 < 1 & Q97.5 < 1), '*', '')) %>%
+  mutate(term = dplyr::recode(term, 'travel_km_idmean'='Distance Traveled', 'home_h_idmean'='Home Stay', 'entropy_idmean'='Entropy'))
+
+
+
+
+concurrent_between_models_plot = concurrent_between %>% dplyr::filter(term %in% c('Distance Traveled', 'Entropy', 'Home Stay')) %>%
+  ggplot(., aes(x = term, y = Estimate, color = term)) +
+    geom_point(size = 3) + 
+    geom_text(aes(label = sig, y = Q97.5*1.1), size = 5) +
+    geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0, lwd = 1) +
+    facet_grid(~type) +
+    geom_hline(yintercept = 1, lty = 2) +
+    coord_flip() +
+    theme_bw() +
+    labs(y = 'Adjusted Odds Ratio', x = NULL, title = 'Between-Person Differences') +
+    scale_color_manual(values = colors, 
+                       limits = c('Distance Traveled', 'Entropy', 'Home Stay')) +
+    theme(legend.position = 'none',
+          axis.text.y = element_text(angle = 30, vjust = 0.5, hjust=1),
+          panel.spacing = unit(0, "lines")) +
+    scale_y_log10()
+
+
+btw_grid = cowplot::plot_grid(concurrent_between_models_plot, between_models_plot, rel_widths = c(2.1, 1),
+                              align = 'h', axis = 'bt')
+
+between_models_plot
+
+table(btw_summary$event_cat1_participant)
+table(btw_summary$ema_trigger_participant)
+38 + 149
+173 + 14
+
+btw_models_summary
+```
+
+#### Make Figure 1
+
+```{r}
+fig1_grid = cowplot::plot_grid(or_cat1_within_plot,
+                               prob_plot_cat1_within, 
+                               or_ema_within_plot,
+                               btw_grid,
+                               labels = c('A', 'B', 'C', 'D'))
+
+cowplot::save_plot(fig1_grid, file = 'plots/supplement/fig1_grid_multihome.png', base_width = 10, base_height = 6)
+```
+
+### Plots/Tables for Analyses on Timing of Suicidal Events Relative to Geolocation
+
+```{r}
+# Models asking whether suicide events are associated with changes in geolocation variables the following week 
+event_fit_homestay_lead1_week = lmer(home_h_dev_lead1week  ~ event_cat1 + schoolclosure + week_num + (1|ID) , data = df)
+
+event_fit_entropy_lead1_week = lmer(entropy_dev_lead1week  ~ event_cat1 + schoolclosure + week_num + (1|ID) , data = df)
+
+event_fit_travel_km_lead1_week = lmer(travel_km_dev_lead1week  ~ event_cat1 +schoolclosure + week_num + (1|ID) , data = df)
+
+tab_model(event_fit_homestay_lead1_week, event_fit_entropy_lead1_week, event_fit_travel_km_lead1_week)
+```
+
+```{r}
+event_predict_geo_emmgrid = rbind(
+  emmeans::emmeans(event_fit_homestay_lead1_week, specs = ~event_cat1) %>% data.frame() %>% mutate(outcome = 'Home Stay'),
+  emmeans::emmeans(event_fit_entropy_lead1_week, specs = ~event_cat1) %>% data.frame() %>% mutate(outcome = 'Entropy'),
+  emmeans::emmeans(event_fit_travel_km_lead1_week, specs = ~event_cat1) %>% data.frame() %>% mutate(outcome = 'Distance Traveled')) %>%
+  dplyr::mutate(event_recat = ifelse(event_cat1 == 0, 'No Suicide Event Last Week', 'Suicide Event Last Week'))
+
+
+event_predict_geolocation_plot = ggplot(event_predict_geo_emmgrid, aes(x = event_recat, y = emmean, color = outcome)) +
+  geom_point(position = position_dodge(0.1)) +
+  geom_line(aes(group = outcome), position = position_dodge(0.1)) +
+  geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL), width = 0, position = position_dodge(0.1)) +
+  scale_color_manual(values = colors) +
+  theme_bw() +
+  labs (y = 'Geolocation Variable Estimate\nWithin-participant centered', x = NULL, 
+        title = 'Geolocation Variables as a Function of Last-Week Suicidal Events')
+
+
+tidy_event_predict_geo = rbind(broom.mixed::tidy(event_fit_homestay_lead1_week, conf.int=TRUE) %>% mutate(outcome = 'Home Stay'),
+                               broom.mixed::tidy(event_fit_entropy_lead1_week, conf.int=TRUE) %>% mutate(outcome = 'Entropy'),
+                               broom.mixed::tidy(event_fit_travel_km_lead1_week, conf.int=TRUE) %>% mutate(outcome = 'Distance Traveled')) %>%
+  dplyr::filter(term == 'event_cat1') %>%
+  mutate(sig_star = ifelse(
+    (conf.low > 0 & conf.high > 0) | (conf.low <0 & conf.high < 0), '*', ''))
+
+event_predict_geolocation_plot2 = ggplot(tidy_event_predict_geo, aes(x = outcome, y = estimate, color = outcome)) +
+  geom_hline(yintercept =0, lty = 2) + 
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0, lwd = 1) +
+  geom_text(aes(x = outcome, y = conf.high*1.04, label = sig_star)) +
+  theme_bw() +
+  labs(x = 'Geolocation Metric (Within-Person Centered)', y = 'Beta Estimate (95% CI)',
+       title = 'Geolocation Variables as a Function of\nLast-Week Suicidal Events') +
+  scale_color_manual(values = colors) +
+  theme(legend.position = 'none')
+
+
+
+
+get_or_brms(fit_event_concurrent)
+
+
+tidy_weeks = rbind(get_or_brms(fit_event_concurrent) %>% mutate(timing = 'Same Week'),
+                   get_or_brms(fit_event_lead1week) %>% mutate(timing = 'T - 1 Week'),
+                   get_or_brms(fit_event_lead2week) %>% mutate(timing = 'T - 2 Weeks'),
+                   get_or_brms(fit_event_lead3week) %>% mutate(timing = 'T - 3 Weeks')) %>%
+  dplyr::filter(term == 'home_h_dev') %>%
+  mutate(timing = factor(timing, levels = c('T - 3 Weeks', 'T - 2 Weeks', 'T - 1 Week', 'Same Week'))) %>%
+  mutate(sig_star = ifelse(
+    (Q2.5 > 1 & Q97.5 > 1) | (Q2.5 > 1 & Q97.5 > 1), '*', ''))
+
+
+tidy_weeks_ema = rbind(broom.mixed::tidy(fit_ema_concurrent_frequentist, exponentiate=TRUE, conf.int=TRUE) %>% mutate(timing = 'Same Week'),
+                   broom.mixed::tidy(fit_ema_lead1week, exponentiate=TRUE, conf.int=TRUE) %>% mutate(timing = 'T - 1 Week'),
+                   broom.mixed::tidy(fit_ema_lead2week, exponentiate=TRUE, conf.int=TRUE) %>% mutate(timing = 'T - 2 Weeks'),
+                   broom.mixed::tidy(fit_ema_lead3week, exponentiate=TRUE, conf.int=TRUE) %>% mutate(timing = 'T - 3 Weeks')) %>%
+  dplyr::filter(term == 'home_h_dev') %>%
+  mutate(timing = factor(timing, levels = c('T - 3 Weeks', 'T - 2 Weeks', 'T - 1 Week', 'Same Week'))) %>%
+  mutate(sig_star = ifelse(
+    (conf.low > 1 & conf.high > 1) | (conf.low <1 & conf.high < 1), '*', ''))
+
+
+
+colors = c( "lightblue", "red","black")
+week_timeline_plot = ggplot(tidy_weeks, aes(x = timing, y = Estimate)) +
+  geom_hline(yintercept = 1, lty = 2) + 
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Q2.5, ymax = Q97.5), width = 0, lwd = 1) +
+  geom_text(aes(x = timing, y = Q97.5*1.04, label = sig_star)) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(x = 'Time Window of Within-Participant Homestay Change\nRelative to Suicidal Events', y = 'aOR (95% CI)',
+       title = 'Suicidal Events as a Function of\nTime-Windowed Homestay')
+
+week_timeline_plot_ema = ggplot(tidy_weeks_ema, aes(x = timing, y = estimate)) +
+  geom_hline(yintercept = 1, lty = 2) + 
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0, lwd = 1) +
+  geom_text(aes(x = timing, y = conf.high*1.04, label = sig_star)) +
+  scale_y_log10() +
+  theme_bw() +
+  labs(x = 'Time Window of Within-Participant Homestay Change\nRelative to Suicidal Ideation', y = 'aOR (95% CI)',
+       title = 'Suicidal Ideation as a Function of\nTime-Windowed Homestay')
+
+
+event_timing_plot = ggplot(data = df %>%
+                             group_by(ID) %>%
+                             mutate(num_weeks = n()) %>%
+                           ungroup() %>%
+                           dplyr::filter(num_weeks > 0) %>%
+         dplyr::mutate(event_recat = ifelse(event_cat1 == 0 | is.na(event_cat1), 'Week with No Suicidal Event', 'Week With Suicidal Event')), 
+         aes(x = week_num, y = factor(ID), fill = event_recat)) +
+  geom_tile(color = 'black') +
+  scale_fill_manual(values = c('gray50', 'red')) +
+  theme_bw() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  scale_x_continuous(limits = c(0,27)) +
+  labs(x = 'Number of Weeks Following Baseline Visit', y = 'Participants', fill = NULL, title = '')
+
+ema_trigger_timing_plot = ggplot(data = df %>%
+                             group_by(ID) %>%
+                             mutate(num_weeks = n()) %>%
+                           ungroup() %>%
+                           dplyr::filter(num_weeks > 0) %>%
+         dplyr::mutate(event_recat = case_when(
+           ema_trigger == 0 ~ "Week With No Clinically Significant Suicide Ideation",
+            ema_trigger == 1 ~ "Week With Clinically Significant Suicide Ideation",
+            is.na(ema_trigger) ~ "Missing Weekly STB Survey")),
+         aes(x = week_num, y = factor(ID), fill = event_recat)) +
+  geom_tile(color = 'black') +
+  scale_fill_manual(values = c('white', 'red', 'gray50')) +
+  theme_bw() +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  scale_x_continuous(limits = c(0,27)) +
+  labs(x = 'Number of Weeks Following Baseline Visit', y = 'Participants', fill = NULL, title = '')
+
+event_occur_grid = cowplot::plot_grid(event_timing_plot, ema_trigger_timing_plot, nrow = 2,
+                                      align = 'v', axis = 'lr', 
+                                      labels = c('A: Suicidal Events', 'B: Clinically Significant Suicide Ideation'))
+
+
+timing_plot = cowplot::plot_grid(week_timeline_plot, event_predict_geolocation_plot2, labels = c('A', 'B'),
+                   rel_widths = c(1.1, 1), align = 'h', axis = 'bt')
+
+cowplot::save_plot(timing_plot, file = 'plots/supplement/fig2_timing_plot_geo_events_multihome.png', base_height = 4, base_width = 10)
+
+ggsave(week_timeline_plot_ema, file = 'plots/supplement/fig2_timing_plot_geo_ema_multihome.png', height = 4, width = 6)
+```
+
+##### Supplemental Table For Timing for Events Analysis
+```{r}
+tidy_weeks %>% mutate(aOR = round(Estimate, 2), 
+         `95% CI`=paste0(round(Q2.5,2), ', ', round(Q97.5, 2))) %>%
+  dplyr::select(timing, aOR, `95% CI`) %>%
+  write.csv(., file = 'tables/homestay_timing_table_multihome.csv', row.names = FALSE)
+
+
+tidy_event_predict_geo %>%
+  mutate(`95% CI`=paste0(round(conf.low,2), ', ', round(conf.high, 2)),
+         estimate = format(round(estimate, 2), nsmall=2),
+         std.error=format(round(std.error,3), nsmall=3),
+         p.value = format(round(p.value, 2), nsmall=2)) %>%
+  dplyr::select(`Variable`=outcome, Beta=estimate, SE=std.error, `95% CI`, p=p.value) %>%
+  write.csv(file = 'tables/suicide_events_predict_homestay_table_multihome.csv', row.names = FALSE)
+```
+
+### Time Since Baseline & Suicide Outcomes
+
+```{r}
+df %>%
+  pivot_longer(c(home_h_dev, entropy_dev, travel_km_dev)) %>%
+  ggplot(data= ., aes(x = week_num, y = value, color = name)) +
+  geom_smooth(method = 'lm')
+```
+
+#### GPS variables as a function of week_num only
+```{r}
+entropy_time= lmerTest::lmer(data = df, entropy_dev ~ week_num + (week_num|ID))
+homestay_time =lmerTest::lmer(data = df, home_h_dev ~ week_num + (week_num|ID))
+travel_time= lmerTest::lmer(data = df, travel_km_dev ~ week_num + (week_num|ID))
+
+sjPlot::tab_model(entropy_time, homestay_time, travel_time)
+```
+
+##### Model events as a function of week_num only
+```{r}
+fit_cat1_within_only_time = glmer(event_cat1  ~  week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+fit_trigger_only_time = glmer(ema_trigger  ~  week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+tab_model(fit_cat1_within_only_time, fit_trigger_only_time, show.stat = TRUE)
+
+sjPlot::plot_model(fit_trigger_only_time, type = 'eff')
+```
+
+
+### Group differences / COVID
+
+```{r}
+load('/Volumes/columbia/MAPS_Data/Analysis/pab_maps_scripts/missing_data/cleaned_data/gps_data_missingness.rda')
+load('/Volumes/columbia/MAPS_Data/Analysis/pab_maps_scripts/cleaned_data/covid.Rda')
+covid = dplyr::select(covid, date, schoolclosure, stayathome, site) 
+covid$schoolclosure = as.numeric(as.character(covid$schoolclosure))
+covid = mutate(covid, site = ifelse(site=='PITT', 'UPMC', site))
+
+daily = left_join(combined_gps, dplyr::select(selfreport_v8, ID, GROUP, Control, SITE, sex, age, iPhone, contains('SSI')) %>% mutate(ID = as.character(ID)), by = 'ID')
+
+daily = dplyr::select(daily, date = dt_feature, site=SITE, everything())
+daily = mutate(daily, site = ifelse(startsWith(x = ID, prefix = '1'), 'CUIMC', 'UPMC'))
+
+
+daily = left_join(daily, covid, by = c('date', 'site'))
+daily = mutate(daily, schoolclosure = ifelse(date > '2022-01-01', 0, schoolclosure),
+                      schoolclosure = ifelse(date < '2020-03-01', 0, schoolclosure))
+
+
+daily = daily %>%
+  group_by(ID) %>%
+  mutate(personal_time = date - min(date)) %>%
+  dplyr::filter(personal_time < 200)
+
+daily = mutate(daily, amt_home_day_h = amt_home_day_minutes/60,
+               age = scale(age, center=TRUE, scale = FALSE))
+
+homestay_group_schoolclosure = lmerTest::lmer(data = daily, amt_home_day_h ~ GROUP + schoolclosure + personal_time +  site + sex + age + iPhone + (1|ID))
+
+homestay_ctrl_schoolclosure = lmerTest::lmer(data = daily, amt_home_day_h ~ Control + schoolclosure + personal_time + site + sex + age + iPhone + (1|ID))
+
+homestay_ssi_schoolclosure = lmerTest::lmer(data = daily, amt_home_day_h ~ SSI19_baseline_imp1month + schoolclosure + personal_time + site + sex + age + iPhone + (1|ID))
+
+tab_model(homestay_group_schoolclosure, homestay_ctrl_schoolclosure, homestay_ssi_schoolclosure)
+```
+
+
+### Association between ideation & events
+
+```{r}
+fit_events_ideation = glmer(event_cat1  ~  ema_trigger +
+                             week_num + (1|ID) , data = df,
+              family = binomial, control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+tab_model(fit_events_ideation)
+
+fit_events_ctrl_ideation = glmer(event_cat1_lead1week  ~  home_h_dev + entropy_dev + travel_km_dev + 
+                                           home_h_idmean + entropy_idmean + travel_km_idmean +  ema_trigger + 
+                             week_num + (1|ID) , data = df,
+              family = binomial(link='logit'), control=glmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e5)))
+
+tab_model(fit_events_ctrl_ideation)
+```
