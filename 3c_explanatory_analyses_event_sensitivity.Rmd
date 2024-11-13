@@ -82,13 +82,13 @@ df = mutate(df,
             home_h_idmean = scale(round(home_min_idmean/60, 3)))
 
 df = dplyr::mutate(df, 
-                   event_cat1_lead1week = ifelse(ID==2013 & week_start_wednesday== as.Date('2019-09-18'),
+                   event_cat1_lead1week = ifelse(ID==9999 & week_start_wednesday== as.Date('1900-01-01'),
                                                  0, event_cat1_lead1week),
-                   event_cat1 = ifelse(ID==2013 & week_start_wednesday== as.Date('2019-09-25'),
+                   event_cat1 = ifelse(ID==9999 & week_start_wednesday== as.Date('1900-01-01'),
                                                  0, event_cat1),
-                   event_cat1_lead2week = ifelse(ID==2013 & week_start_wednesday== as.Date('2019-09-11'),
+                   event_cat1_lead2week = ifelse(ID==9999 & week_start_wednesday== as.Date('1900-01-01'),
                                                  0, event_cat1_lead2week),
-                   event_cat1_lead3week = ifelse(ID==2013 & week_start_wednesday== as.Date('2019-09-04'),
+                   event_cat1_lead3week = ifelse(ID==9999 & week_start_wednesday== as.Date('1900-01-01'),
                                                  0, event_cat1_lead3week))
 
 length(unique(df$ID))
