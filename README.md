@@ -1,2 +1,5 @@
-# maps_geolocation_suicide
-Using Smartphone Derived GPS Data to Improve the Short-term Prediction of Suicidal Thoughts and Behaviors in High-Risk Adolescents
+# Using Smartphone GPS Data to Detect the Risk of Adolescent Suicidal Thoughts and Behaviors
+
+Code for analyses in Auerbach & Bloom et al (2025)
+
+doi:10.1001/jamanetworkopen.2024.56429
